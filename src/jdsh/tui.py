@@ -1,8 +1,16 @@
 import time
 import sys
-import select
-import tty
-import termios
+
+try:
+    # Linux & MacOS
+    import select
+    import tty
+    import termios
+except ImportError:
+    # Windows
+    select = tty = termios = None
+    import msvcrt
+
 from rich.live import Live
 from rich.table import Table
 from rich.layout import Layout
@@ -17,16 +25,26 @@ from . import utils, config
 
 class KeyboardInput:
     def __enter__(self):
-        self.old_settings = termios.tcgetattr(sys.stdin)
-        tty.setcbreak(sys.stdin.fileno())
+        if termios:
+            self.old_settings = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
         return self
 
     def __exit__(self, type, value, traceback):
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+        if termios:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
 
     def get_key(self):
-        if select.select([sys.stdin], [], [], 0)[0]:
-            return sys.stdin.read(1)
+        if termios:
+            if select.select([sys.stdin], [], [], 0)[0]:
+                return sys.stdin.read(1)
+        
+        elif msvcrt:
+            if msvcrt.kbhit():
+                try:
+                    return msvcrt.getch().decode("utf-8", errors="ignore")
+                except:
+                    pass
         return None
 
 def generate_layout(state, active_links, pending_links, override_status=None):
