@@ -6,7 +6,7 @@ Control and Manage your JDownloader within your terminal with _ease_.
 
 Designed for Linux servers/headless environments where you need full control without a GUI; or if you just love using CLI!
 
-Packed with various **CLI Commands** & **Interactive Mode (TUI)**.
+Packed with various **Commands** & **Interactive Mode (TUI)**.
 
 This tool will use your JDownloader local API, which you will need to enable manually. It uses [myjadpi](https://github.com/mmarquezs/My.Jdownloader-API-Python-Library/) package under the hood to work (kudos to the author of this package).
 
