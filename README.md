@@ -13,21 +13,15 @@ This tool will use your JDownloader local API, which you will need to enable man
 1.  Obviously have **JDownloader 2** installed.
 2.  Enable JDownloader's Local API:
     *   Edit `<JD_FOLDER>/cfg/org.jdownloader.api.RemoteAPIConfig.json`.
-    *   Set: `"deprecatedapienabled": true`
+    *   Set `"deprecatedapienabled": true`
+    *   _(Optional)_ you may also need to set `deprecatedapilocalhostonly` to `false` if you want to access it from remote. 
     *   Restart JDownloader.
 
-3.  Clone this repository or download the source code:
+3.  Install the package using pip:
     ```bash
-    git clone https://github.com/al00x/jdsh.git
-    cd jdsh
+    pip install jdsh
     ```
 
-4.  Install the package using pip:
-    ```bash
-    pip install .
-    ```
-    
-    *Note: If you want to modify the code, use `pip install -e .` instead.*
 
 ## Usage
 
