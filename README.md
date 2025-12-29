@@ -10,20 +10,19 @@ Packed with various **Commands** & **Interactive Mode (TUI)**.
 
 This tool will use your JDownloader local API, which you will need to enable manually. It uses [myjadpi](https://github.com/mmarquezs/My.Jdownloader-API-Python-Library/) package under the hood to work (kudos to the author of this package).
 
+## Installation
+```bash
+pip install jdsh
+```
+
 ## Setup
 
-1.  Obviously have **JDownloader 2** installed.
-2.  Enable JDownloader's Local API:
+0.  Obviously have **JDownloader 2** installed.
+1.  Enable JDownloader's Local API:
     *   Edit `<JD_FOLDER>/cfg/org.jdownloader.api.RemoteAPIConfig.json`.
     *   Set `"deprecatedapienabled": true`
     *   _(Optional)_ you may also need to set `deprecatedapilocalhostonly` to `false` if you want to access it from remote. 
     *   Restart JDownloader.
-
-3.  Install the package using pip:
-    ```bash
-    pip install jdsh
-    ```
-
 
 ## Usage
 
@@ -85,7 +84,7 @@ jd
 ## Config
 By default, the application runs with standard settings (`Host: 127.0.0.1, Port: 3128`). You can override these defaults by creating a configuration file.
 
-Create file at `~/.config/jdsh/jdsh.config`, with content below.
+Create file at `~/.config/jdsh/jdsh.config`, with the contents below.
 You may uncomment any line and change when you need.
 
 ```ini
@@ -93,12 +92,13 @@ You may uncomment any line and change when you need.
 # HOST = 127.0.0.1
 # PORT = 3128
 
-# change the rate of interactive mode update interval. Based on seconds
+# update interval of interactive mode, in seconds
 # REFRESH_RATE = 1.0
 ```
 
 ---
 #### Enjoying the tool? Your supports would keep me at it! 💖
 
-[![Donate with Bitcoin](https://img.shields.io/badge/Donate-Bitcoin-orange.svg?logo=bitcoin)](bc1qc06cpqe26m6fpf5guw6x5vp3pfwrzavy2yjrh7)
-[![Donate with Tehter (BEP20)](https://img.shields.io/badge/Donate-Tether%20(BEP20)-blue.svg?logo=tether)](0x283857017efb4B1F9fAe57F4599C20FD5bCE1871)
+[![Donate with Bitcoin](https://img.shields.io/badge/Donate-Bitcoin-orange.svg?logo=bitcoin)](https://blockchain.com/btc/address/bc1qvmv8cnfd0hfc82rm3r9zzq6uheejgw5hfzn426)
+[![Donate with Ethereum](https://img.shields.io/badge/Donate-Ethereum-silver.svg?logo=ethereum)](https://etherscan.io/address/0xA25c8eF121ba010d09c6A7E1228be7da523933f8)
+[![Donate with Tehter (BEP20)](https://img.shields.io/badge/Donate-Tether%20(BEP20)-blue.svg?logo=tether)](https://bscscan.com/address/0x283857017efb4B1F9fAe57F4599C20FD5bCE1871)
