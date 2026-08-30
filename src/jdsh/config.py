@@ -23,3 +23,4 @@ REFRESH_RATE = parser.getfloat("settings", "refresh_rate", fallback=1.0)
 # "blue" under white text is unreadable. Pin the pair instead, and let it be
 # overridden for themes it does not suit.
 SELECTION_STYLE = parser.get("settings", "selection_style", fallback="bold #ffffff on #1c3f6e")
+MARK_STYLE = parser.get("settings", "mark_style", fallback="#ffffff on #16293f")

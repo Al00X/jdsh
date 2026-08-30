@@ -38,6 +38,7 @@ MODE_CONFIRM = "confirm"
 # background into a light one and leave white text unreadable on top of it.
 # Both ends of the pair are pinned, and the selection is configurable.
 SELECTED_STYLE = config.SELECTION_STYLE
+MARKED_STYLE = config.MARK_STYLE
 TAB_ACTIVE_STYLE = "bold #10161f on #7cc7ff"
 
 
@@ -130,6 +131,11 @@ class Row:
     def name(self):
         return self.item.get("name", "?")
 
+    @property
+    def key(self):
+        """Identity used by the marking set: uuids repeat across kinds."""
+        return (self.kind, self.uuid)
+
     def ids(self):
         """(link_ids, package_ids) as the API expects them."""
         if self.is_package:
@@ -156,42 +162,67 @@ class MenuEntry:
         self.confirm = confirm
 
 
-def context_menu(tab, row):
-    """The actions the API actually supports for this row."""
-    enabled = row.item.get("enabled", True)
-    toggle = MenuEntry("Disable" if enabled else "Enable", "toggle_enabled")
+def collect_ids(rows):
+    """(link_ids, package_ids) for a whole selection."""
+    link_ids = [r.uuid for r in rows if not r.is_package]
+    package_ids = [r.uuid for r in rows if r.is_package]
+    return link_ids, package_ids
+
+
+def describe(rows):
+    if len(rows) == 1:
+        return "Package" if rows[0].is_package else "Link"
+    packages = sum(1 for r in rows if r.is_package)
+    links = len(rows) - packages
+    parts = []
+    if packages:
+        parts.append(f"{packages} package{'s' if packages > 1 else ''}")
+    if links:
+        parts.append(f"{links} link{'s' if links > 1 else ''}")
+    return " + ".join(parts)
+
+
+def context_menu(tab, rows):
+    """The actions the API actually supports for this selection."""
+    single = rows[0] if len(rows) == 1 else None
+    # Disable only makes sense while something is still enabled.
+    any_enabled = any(r.item.get("enabled", True) for r in rows)
+    suffix = "" if single else " all"
+    toggle = MenuEntry(("Disable" if any_enabled else "Enable") + suffix, "toggle_enabled")
 
     if tab == TAB_LINKGRABBER:
         entries = [
-            MenuEntry("Move to download list", "move_to_downloads"),
+            MenuEntry("Move to download list" + suffix, "move_to_downloads"),
             toggle,
-            MenuEntry("Remove", "remove", confirm=True),
+            MenuEntry("Remove" + suffix, "remove", confirm=True),
         ]
     else:
         entries = [
-            MenuEntry("Force download", "force"),
+            MenuEntry("Force download" + suffix, "force"),
             toggle,
-            MenuEntry("Reset", "reset", confirm=True),
-            MenuEntry("Remove", "remove", confirm=True),
+            MenuEntry("Reset" + suffix, "reset", confirm=True),
+            MenuEntry("Remove" + suffix, "remove", confirm=True),
         ]
-        if row.is_package:
+        if any(r.is_package for r in rows):
             entries.insert(3, MenuEntry("Delete finished links", "cleanup", confirm=True))
 
-    if row.is_package:
+    if single is not None and single.is_package:
         entries.insert(0, MenuEntry("Collapse / Expand", "expand"))
 
-    entries.append(MenuEntry("Properties", "properties"))
+    if single is not None:
+        entries.append(MenuEntry("Properties", "properties"))
     return entries
 
 
-def run_action(client, tab, row, action):
-    """Perform one menu action. Returns the message to show in the footer."""
-    link_ids, package_ids = row.ids()
+def run_action(client, tab, rows, action):
+    """Perform one menu action on the selection. Returns a footer message."""
+    link_ids, package_ids = collect_ids(rows)
     grabber = tab == TAB_LINKGRABBER
-    what = "Package" if row.is_package else "Link"
+    what = describe(rows)
 
     if action == "toggle_enabled":
-        enable = not row.item.get("enabled", True)
+        # Mixed selections are switched off first, matching the menu label.
+        enable = not any(r.item.get("enabled", True) for r in rows)
         client.set_enabled(enable, link_ids, package_ids, grabber=grabber)
         return f"{what} {'enabled' if enable else 'disabled'}"
 
@@ -334,7 +365,19 @@ def _tab_bar(tab, downloads, grabber):
     return bar
 
 
-def _downloads_table(rows, cursor, expanded, height):
+def _row_style(row, i, cursor, marked):
+    if i == cursor:
+        return SELECTED_STYLE
+    if row.key in marked:
+        return MARKED_STYLE
+    return None
+
+
+def _mark(row, marked):
+    return "✓" if row.key in marked else " "
+
+
+def _downloads_table(rows, cursor, expanded, height, marked=frozenset()):
     t = Table(expand=True, box=box.SIMPLE, show_edge=False, pad_edge=False)
     t.add_column("Name", ratio=3, no_wrap=True)
     t.add_column("Links", width=6, justify="right", style="dim")
@@ -351,11 +394,11 @@ def _downloads_table(rows, cursor, expanded, height):
 
     window, offset = _visible_window(rows, cursor, height)
     for i, row in enumerate(window, start=offset):
-        style = SELECTED_STYLE if i == cursor else None
+        style = _row_style(row, i, cursor, marked)
         item = row.item
         if row.is_package:
             pct = _package_progress(item)
-            marker = "▼" if item.get("uuid") in expanded else "▶"
+            marker = f"{_mark(row, marked)}{'▼' if item.get('uuid') in expanded else '▶'}"
             bar = ProgressBar(
                 total=100, completed=pct, width=None, style="grey23",
                 complete_style="bold bright_cyan", finished_style="bold bright_green",
@@ -375,7 +418,7 @@ def _downloads_table(rows, cursor, expanded, height):
             total = item.get("bytesTotal") or 0
             pct = 100.0 if item.get("finished") else ((item.get("bytesLoaded", 0) / total) * 100 if total else 0.0)
             t.add_row(
-                Text(f"    └ {row.name}", style="dim" if style is None else None),
+                Text(f" {_mark(row, marked)}  └ {row.name}", style="dim" if style is None else None),
                 "",
                 f"{utils.human_size(item.get('bytesLoaded', 0))}/{utils.human_size(total)}",
                 item.get("status") or ("Finished" if item.get("finished") else "-"),
@@ -388,7 +431,7 @@ def _downloads_table(rows, cursor, expanded, height):
     return t
 
 
-def _grabber_table(rows, cursor, expanded, height):
+def _grabber_table(rows, cursor, expanded, height, marked=frozenset()):
     t = Table(expand=True, box=box.SIMPLE, show_edge=False, pad_edge=False)
     t.add_column("Name", ratio=3, no_wrap=True)
     t.add_column("Links", width=6, justify="right", style="dim")
@@ -404,10 +447,10 @@ def _grabber_table(rows, cursor, expanded, height):
 
     window, offset = _visible_window(rows, cursor, height)
     for i, row in enumerate(window, start=offset):
-        style = SELECTED_STYLE if i == cursor else None
+        style = _row_style(row, i, cursor, marked)
         item = row.item
         if row.is_package:
-            marker = "▼" if item.get("uuid") in expanded else "▶"
+            marker = f"{_mark(row, marked)}{'▼' if item.get('uuid') in expanded else '▶'}"
             hosts = item.get("hosts") or []
             t.add_row(
                 f"{marker} {row.name}",
@@ -422,7 +465,7 @@ def _grabber_table(rows, cursor, expanded, height):
         else:
             availability = item.get("availability", "-")
             t.add_row(
-                Text(f"    └ {row.name}", style="dim" if style is None else None),
+                Text(f" {_mark(row, marked)}  └ {row.name}", style="dim" if style is None else None),
                 "",
                 utils.human_size(item.get("bytesTotal", 0)),
                 availability if availability == "ONLINE" else "",
@@ -434,14 +477,14 @@ def _grabber_table(rows, cursor, expanded, height):
     return t
 
 
-def _menu_panel(entries, index, row):
+def _menu_panel(entries, index, rows):
     t = Table.grid(padding=(0, 1))
     t.add_column()
     for i, entry in enumerate(entries):
         prefix = "›" if i == index else " "
         style = SELECTED_STYLE if i == index else ("red" if entry.confirm else "white")
         t.add_row(Text(f"{prefix} {entry.label}", style=style))
-    title = "Package" if row.is_package else "Link"
+    title = describe(rows)
     return Panel(t, title=title, subtitle="[dim]Enter run · Esc close[/]",
                  border_style="bright_cyan", box=box.ROUNDED)
 
@@ -458,24 +501,28 @@ def _properties_panel(row):
 
 def generate_layout(state, downloads, grabber, rows=None, tab=TAB_DOWNLOADS, cursor=0,
                     expanded=frozenset(), body_height=20, override_status=None,
-                    mode=MODE_LIST, menu=None, menu_index=0, message=""):
+                    mode=MODE_LIST, menu=None, menu_index=0, message="",
+                    marked=frozenset()):
     header, border_color = _header(state, downloads, override_status)
 
     if rows is None:
         rows = build_rows(downloads if tab == TAB_DOWNLOADS else grabber, expanded)
 
     if tab == TAB_DOWNLOADS:
-        table = _downloads_table(rows, cursor, expanded, body_height)
+        table = _downloads_table(rows, cursor, expanded, body_height, marked)
         title = "Downloads"
     else:
-        table = _grabber_table(rows, cursor, expanded, body_height)
+        table = _grabber_table(rows, cursor, expanded, body_height, marked)
         title = "Link Grabber"
 
+    if marked:
+        title = f"{title}  [bright_cyan]({len(marked)} selected)[/]"
     body = Panel(table, title=title, border_style=border_color, box=box.ROUNDED)
     row = rows[cursor] if rows and cursor < len(rows) else None
 
     if mode == MODE_MENU and row is not None:
-        side = Layout(_menu_panel(menu or [], menu_index, row), size=32)
+        target = [r for r in rows if r.key in marked] or [row]
+        side = Layout(_menu_panel(menu or [], menu_index, target), size=34)
         body_layout = Layout(name="body")
         body_layout.split_row(Layout(body), side)
     elif mode == MODE_PROPERTIES and row is not None:
@@ -492,9 +539,10 @@ def generate_layout(state, downloads, grabber, rows=None, tab=TAB_DOWNLOADS, cur
     else:
         footer = Align.center(
             "[dim][bold white]Tab[/] switch  |  [bold white]↑↓[/] move  |  "
-            "[bold white]→←[/] expand  |  [bold white]Enter[/] menu  |  "
-            "[bold white]p[/] properties  |  [bold white]s[/] start/stop  |  "
-            "[bold white]q[/] quit[/]"
+            "[bold white]→←[/] expand  |  [bold white]Space[/] mark  |  "
+            "[bold white]a[/] mark all  |  [bold white]Esc[/] clear  |  "
+            "[bold white]Enter[/] menu  |  [bold white]p[/] properties  |  "
+            "[bold white]s[/] start/stop  |  [bold white]q[/] quit[/]"
         )
 
     layout = Layout()
@@ -550,6 +598,7 @@ def run(client):
     tab = TAB_DOWNLOADS
     cursor = 0
     expanded = set()
+    marked = set()
     mode = MODE_LIST
     menu, menu_index, pending = [], 0, None
     message = ""
@@ -571,11 +620,19 @@ def run(client):
     def draw(live):
         live.update(generate_layout(
             state, downloads, grabber, rows, tab, cursor, expanded,
-            body_height(), override, mode, menu, menu_index, message,
+            body_height(), override, mode, menu, menu_index, message, marked,
         ), refresh=True)
 
     def current_row():
         return rows[cursor] if rows and cursor < len(rows) else None
+
+    def target_rows():
+        """Marked rows if any, otherwise the row under the cursor."""
+        selection = [r for r in rows if r.key in marked]
+        if selection:
+            return selection
+        row = current_row()
+        return [row] if row is not None else []
 
     def toggle_expand(row):
         if row is not None and row.is_package:
@@ -583,12 +640,12 @@ def run(client):
             rebuild()
 
     def execute(action):
-        nonlocal message, mode, expanded
-        row = current_row()
-        if row is None:
+        nonlocal message, mode
+        targets = target_rows()
+        if not targets:
             return
         if action == "expand":
-            toggle_expand(row)
+            toggle_expand(current_row())
             message = ""
             return
         if action == "properties":
@@ -596,9 +653,10 @@ def run(client):
             return
         try:
             with api_lock:
-                message = run_action(client, tab, row, action)
+                message = run_action(client, tab, targets, action)
         except Exception as exc:
             message = f"Failed: {exc}"
+        marked.clear()
         mode = MODE_LIST
 
     api_lock = threading.Lock()
@@ -657,7 +715,9 @@ def run(client):
                         if entry.confirm:
                             pending = entry.action
                             mode = MODE_CONFIRM
-                            message = f"{entry.label} '{current_row().name[:40]}'?  [y/N]"
+                            targets = target_rows()
+                            subject = targets[0].name[:40] if len(targets) == 1 else describe(targets)
+                            message = f"{entry.label} on {subject}?  [y/N]"
                         else:
                             execute(entry.action)
                     draw(live)
@@ -671,13 +731,25 @@ def run(client):
                 if key == "\t":
                     tab = TAB_LINKGRABBER if tab == TAB_DOWNLOADS else TAB_DOWNLOADS
                     cursor = 0
+                    marked.clear()
                     rebuild()
                 elif key in ("UP", "k"):
                     cursor = max(0, cursor - 1)
                 elif key in ("DOWN", "j"):
                     cursor = min(max(0, len(rows) - 1), cursor + 1)
-                elif key in ("RIGHT", " "):
+                elif key == "RIGHT":
                     toggle_expand(current_row())
+                elif key == " ":
+                    row = current_row()
+                    if row is not None:
+                        marked.symmetric_difference_update({row.key})
+                elif key in ("a", "A"):
+                    if marked:
+                        marked.clear()
+                    else:
+                        marked.update(r.key for r in rows)
+                elif key == "\x1b":
+                    marked.clear()
                 elif key == "LEFT":
                     row = current_row()
                     if row is not None and not row.is_package:
@@ -687,9 +759,9 @@ def run(client):
                         expanded.discard(row.uuid)
                         rebuild()
                 elif key in ("\r", "\n"):
-                    row = current_row()
-                    if row is not None:
-                        menu = context_menu(tab, row)
+                    targets = target_rows()
+                    if targets:
+                        menu = context_menu(tab, targets)
                         menu_index = 0
                         mode = MODE_MENU
                 elif key in ("p", "P"):
