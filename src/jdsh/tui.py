@@ -1,3 +1,5 @@
+import os
+import re
 import time
 import sys
 
@@ -27,6 +29,15 @@ TAB_DOWNLOADS = 0
 TAB_LINKGRABBER = 1
 
 class KeyboardInput:
+    # Cursor keys arrive as an escape sequence: ESC followed by '[' or 'O'
+    # (the latter when the terminal is in application cursor mode, which is
+    # common on an alternate screen) and a final letter.
+    ARROWS = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}
+    ESCAPE_SEQUENCE = re.compile(r"\x1b[\[O]([A-D])")
+
+    def __init__(self):
+        self._pending = ""
+
     def __enter__(self):
         if termios:
             self.old_settings = termios.tcgetattr(sys.stdin)
@@ -37,17 +48,37 @@ class KeyboardInput:
         if termios:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
 
+    def _drain(self):
+        """Read straight from the file descriptor.
+
+        Reading through sys.stdin would pull the whole escape sequence into
+        Python's own buffer while select() still reports the descriptor as
+        empty, leaving the rest of the sequence stranded.
+        """
+        while select.select([sys.stdin], [], [], 0)[0]:
+            data = os.read(sys.stdin.fileno(), 1024)
+            if not data:
+                break
+            self._pending += data.decode("utf-8", errors="ignore")
+
     def get_key(self):
         if termios:
-            if select.select([sys.stdin], [], [], 0)[0]:
-                ch = sys.stdin.read(1)
-                if ch != "\x1b":
-                    return ch
-                # Arrow keys arrive as an escape sequence: ESC [ A/B/C/D
-                seq = ""
-                while select.select([sys.stdin], [], [], 0.01)[0] and len(seq) < 3:
-                    seq += sys.stdin.read(1)
-                return {"[A": "UP", "[B": "DOWN", "[C": "RIGHT", "[D": "LEFT"}.get(seq, "\x1b")
+            self._drain()
+            if not self._pending:
+                return None
+
+            if not self._pending.startswith("\x1b"):
+                key, self._pending = self._pending[0], self._pending[1:]
+                return key
+
+            match = self.ESCAPE_SEQUENCE.match(self._pending)
+            if match:
+                self._pending = self._pending[match.end():]
+                return self.ARROWS[match.group(1)]
+
+            # A bare ESC, or a sequence we do not handle: drop one character.
+            self._pending = self._pending[1:]
+            return "\x1b"
 
         elif msvcrt:
             if msvcrt.kbhit():
