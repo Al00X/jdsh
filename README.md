@@ -35,9 +35,26 @@ Simply run `jd` without arguments to enter the interactive mode.
 jd
 ```
 
-*   **Tips:** 
-    *   Press `s` to Start/Stop downloads. 
-    *   Press `Ctrl+C` to quit.
+The interactive mode shows the same tree as the JDownloader GUI: packages
+with their links, split across a **Downloads** and a **Link Grabber** tab.
+
+| Key | Action |
+| --- | --- |
+| `Tab` | Switch between Downloads and Link Grabber |
+| `↑` `↓` (or `k` `j`) | Move the cursor |
+| `→` `←` | Expand / collapse a package |
+| `Space` | Mark the row under the cursor |
+| `a` | Mark every row, or clear the marks |
+| `Esc` | Clear the selection |
+| `Enter` | Open the context menu on the selection |
+| `p` | Show the properties of the selected row |
+| `s` | Start / stop downloads |
+| `c` | Move the whole Link Grabber to the download list |
+| `q` (or `Ctrl+C`) | Quit |
+
+The context menu acts on every marked row at once, so a dozen links can be
+forced, reset, disabled or removed in a single action. Destructive entries
+ask for confirmation first.
 
 ### Commands Overview
 
@@ -84,7 +101,7 @@ jd
 ## Config
 By default, the application runs with standard settings (`Host: 127.0.0.1, Port: 3128`). You can override these defaults by creating a configuration file.
 
-Create file at `~/.config/jdsh/jdsh.config`, with the contents below.
+Create file at `~/.config/jdsh/jdsh.conf`, with the contents below.
 You may uncomment any line and change when you need.
 
 ```ini
@@ -94,6 +111,11 @@ You may uncomment any line and change when you need.
 
 # update interval of interactive mode, in seconds
 # REFRESH_RATE = 1.0
+
+# colours of the selected and of the marked rows, for themes the
+# defaults do not suit
+# SELECTION_STYLE = bold #ffffff on #1c3f6e
+# MARK_STYLE = #ffffff on #16293f
 ```
 
 ---
