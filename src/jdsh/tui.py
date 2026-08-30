@@ -34,6 +34,12 @@ MODE_MENU = "menu"
 MODE_PROPERTIES = "properties"
 MODE_CONFIRM = "confirm"
 
+# Palette names are remapped by the terminal theme, which can turn a "blue"
+# background into a light one and leave white text unreadable on top of it.
+# Both ends of the pair are pinned, and the selection is configurable.
+SELECTED_STYLE = config.SELECTION_STYLE
+TAB_ACTIVE_STYLE = "bold #10161f on #7cc7ff"
+
 
 class KeyboardInput:
     # Cursor keys arrive as an escape sequence: ESC followed by '[' or 'O'
@@ -314,7 +320,7 @@ def _header(state, downloads, override_status=None):
 
 def _tab_bar(tab, downloads, grabber):
     def render(label, count, active):
-        style = "bold black on bright_cyan" if active else "dim"
+        style = TAB_ACTIVE_STYLE if active else "dim"
         return Text(f" {label} ({count}) ", style=style)
 
     bar = Table.grid(expand=True)
@@ -326,9 +332,6 @@ def _tab_bar(tab, downloads, grabber):
         ("   Tab to switch", "dim"),
     ))
     return bar
-
-
-SELECTED_STYLE = "bold white on blue"
 
 
 def _downloads_table(rows, cursor, expanded, height):
