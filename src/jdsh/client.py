@@ -137,6 +137,21 @@ class JDClient:
             link_ids, package_ids,
         )
 
+    def add_links(self, links, package_name=None, destination=None,
+                  extract_password=None, download_password=None,
+                  priority="DEFAULT", autostart=False):
+        """Send links to the LinkGrabber, as the GUI's add dialog does."""
+        self.device.linkgrabber.add_links([{
+            "links": links,
+            "packageName": package_name or None,
+            "destinationFolder": destination or None,
+            "extractPassword": extract_password or None,
+            "downloadPassword": download_password or None,
+            "priority": priority,
+            "autostart": autostart,
+            "overwritePackagizerRules": False,
+        }])
+
     def move_to_downloadlist(self, link_ids, package_ids):
         self.device.linkgrabber.move_to_downloadlist(link_ids, package_ids)
 

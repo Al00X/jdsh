@@ -48,9 +48,13 @@ with their links, split across a **Downloads** and a **Link Grabber** tab.
 | `Esc` | Clear the selection |
 | `Enter` | Open the context menu on the selection |
 | `p` | Show the properties of the selected row |
+| `n` | Add links to the Link Grabber |
 | `s` | Start / stop downloads |
 | `c` | Move the whole Link Grabber to the download list |
 | `q` (or `Ctrl+C`) | Quit |
+
+`n` opens the same form as the GUI's add dialog: urls, package name,
+destination folder, extract and download passwords, priority and autostart.
 
 The context menu acts on every marked row at once, so a dozen links can be
 forced, reset, disabled or removed in a single action. Destructive entries

@@ -33,6 +33,7 @@ MODE_LIST = "list"
 MODE_MENU = "menu"
 MODE_PROPERTIES = "properties"
 MODE_CONFIRM = "confirm"
+MODE_ADD = "add"
 
 # Palette names are remapped by the terminal theme, which can turn a "blue"
 # background into a light one and leave white text unreadable on top of it.
@@ -276,6 +277,94 @@ def properties(row):
     return [(k, str(v)) for k, v in fields if v not in (None, "", [])]
 
 
+# --- add links form ---------------------------------------------------------
+
+PRIORITIES = ["HIGHEST", "HIGHER", "HIGH", "DEFAULT", "LOW", "LOWER", "LOWEST"]
+
+
+class AddForm:
+    """The fields of the GUI's "Analyse and add links" dialog."""
+
+    FIELDS = [
+        ("links", "Links", "text"),
+        ("package_name", "Package name", "text"),
+        ("destination", "Save to", "text"),
+        ("extract_password", "Extract password", "text"),
+        ("download_password", "Download password", "text"),
+        ("priority", "Priority", "choice"),
+        ("autostart", "Autostart", "flag"),
+    ]
+    HINTS = {
+        "links": "one or more urls, separated by spaces",
+        "package_name": "leave empty for automatic",
+        "destination": "leave empty for the default folder",
+    }
+
+    def __init__(self):
+        self.values = {name: "" for name, _, kind in self.FIELDS if kind == "text"}
+        self.values["priority"] = "DEFAULT"
+        self.values["autostart"] = False
+        self.index = 0
+
+    @property
+    def field(self):
+        return self.FIELDS[self.index]
+
+    def move(self, delta):
+        self.index = (self.index + delta) % len(self.FIELDS)
+
+    def type(self, text):
+        name, _, kind = self.field
+        if kind == "text":
+            self.values[name] += text
+
+    def backspace(self):
+        name, _, kind = self.field
+        if kind == "text":
+            self.values[name] = self.values[name][:-1]
+
+    def cycle(self, delta):
+        name, _, kind = self.field
+        if kind == "choice":
+            i = PRIORITIES.index(self.values[name])
+            self.values[name] = PRIORITIES[(i + delta) % len(PRIORITIES)]
+        elif kind == "flag":
+            self.values[name] = not self.values[name]
+
+    @property
+    def is_valid(self):
+        return bool(self.values["links"].strip())
+
+
+def _add_panel(form):
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style="dim", justify="right", width=18)
+    t.add_column(overflow="fold")
+
+    for i, (name, label, kind) in enumerate(form.FIELDS):
+        active = i == form.index
+        value = form.values[name]
+        if kind == "flag":
+            shown = Text("[x] yes" if value else "[ ] no")
+        elif kind == "choice":
+            shown = Text(f"\u2039 {value} \u203a")
+        else:
+            shown = Text(value or "")
+            if not value and not active and name in form.HINTS:
+                shown = Text(form.HINTS[name], style="dim italic")
+            if active:
+                shown.append("\u258f")
+        if active:
+            shown.stylize(SELECTED_STYLE)
+        t.add_row(Text(label, style="bold" if active else "dim"), shown)
+
+    hint = "Enter add \u00b7 Tab/\u2191\u2193 field \u00b7 \u2190\u2192 change \u00b7 Esc cancel"
+    if not form.is_valid:
+        hint = "Paste at least one url \u00b7 " + hint
+    return Panel(t, title="Add links to the Link Grabber", subtitle=f"[dim]{hint}[/]",
+                 border_style="bright_cyan", box=box.ROUNDED, padding=(1, 2))
+
+
 # --- rendering --------------------------------------------------------------
 
 def _package_progress(pkg):
@@ -502,7 +591,7 @@ def _properties_panel(row):
 def generate_layout(state, downloads, grabber, rows=None, tab=TAB_DOWNLOADS, cursor=0,
                     expanded=frozenset(), body_height=20, override_status=None,
                     mode=MODE_LIST, menu=None, menu_index=0, message="",
-                    marked=frozenset()):
+                    marked=frozenset(), form=None):
     header, border_color = _header(state, downloads, override_status)
 
     if rows is None:
@@ -520,7 +609,9 @@ def generate_layout(state, downloads, grabber, rows=None, tab=TAB_DOWNLOADS, cur
     body = Panel(table, title=title, border_style=border_color, box=box.ROUNDED)
     row = rows[cursor] if rows and cursor < len(rows) else None
 
-    if mode == MODE_MENU and row is not None:
+    if mode == MODE_ADD:
+        body_layout = Layout(Align.center(_add_panel(form), vertical="middle"))
+    elif mode == MODE_MENU and row is not None:
         target = [r for r in rows if r.key in marked] or [row]
         side = Layout(_menu_panel(menu or [], menu_index, target), size=34)
         body_layout = Layout(name="body")
@@ -542,7 +633,8 @@ def generate_layout(state, downloads, grabber, rows=None, tab=TAB_DOWNLOADS, cur
             "[bold white]→←[/] expand  |  [bold white]Space[/] mark  |  "
             "[bold white]a[/] mark all  |  [bold white]Esc[/] clear  |  "
             "[bold white]Enter[/] menu  |  [bold white]p[/] properties  |  "
-            "[bold white]s[/] start/stop  |  [bold white]q[/] quit[/]"
+            "[bold white]n[/] add links  |  [bold white]s[/] start/stop  |  "
+            "[bold white]q[/] quit[/]"
         )
 
     layout = Layout()
@@ -601,6 +693,7 @@ def run(client):
     marked = set()
     mode = MODE_LIST
     menu, menu_index, pending = [], 0, None
+    form = None
     message = ""
     override = None
     rows = []
@@ -621,6 +714,7 @@ def run(client):
         live.update(generate_layout(
             state, downloads, grabber, rows, tab, cursor, expanded,
             body_height(), override, mode, menu, menu_index, message, marked,
+            form,
         ), refresh=True)
 
     def current_row():
@@ -686,6 +780,56 @@ def run(client):
                         rebuild()
                         draw(live)
                     time.sleep(0.01)
+                    continue
+
+                if mode == MODE_ADD:
+                    if key == "\x1b":
+                        mode, form, message = MODE_LIST, None, "Cancelled"
+                    elif key in ("\r", "\n"):
+                        if form.is_valid:
+                            try:
+                                with api_lock:
+                                    client.add_links(
+                                        form.values["links"].strip(),
+                                        form.values["package_name"],
+                                        form.values["destination"],
+                                        form.values["extract_password"],
+                                        form.values["download_password"],
+                                        form.values["priority"],
+                                        form.values["autostart"],
+                                    )
+                                count = len(form.values["links"].split())
+                                message = f"Sent {count} url{'s' if count > 1 else ''} to the Link Grabber"
+                                mode, form = MODE_LIST, None
+                            except Exception as exc:
+                                message = f"Failed: {exc}"
+                        else:
+                            message = "Paste at least one url"
+                    elif key == "\t" or key == "DOWN":
+                        form.move(1)
+                    elif key == "UP":
+                        form.move(-1)
+                    elif key in ("LEFT", "RIGHT"):
+                        form.cycle(-1 if key == "LEFT" else 1)
+                    elif key in ("\x7f", "\b"):
+                        form.backspace()
+                    elif len(key) == 1 and key.isprintable():
+                        # Take the rest of a paste in one go instead of one
+                        # character per redraw.
+                        chunk = key
+                        while True:
+                            nxt = kbd.get_key()
+                            if nxt is None:
+                                break
+                            if len(nxt) == 1 and nxt.isprintable():
+                                chunk += nxt
+                                continue
+                            if nxt in ("\r", "\n"):
+                                chunk += " "
+                                continue
+                            break
+                        form.type(chunk)
+                    draw(live)
                     continue
 
                 if mode == MODE_CONFIRM:
@@ -767,6 +911,9 @@ def run(client):
                 elif key in ("p", "P"):
                     if current_row() is not None:
                         mode = MODE_PROPERTIES
+                elif key in ("n", "N"):
+                    form = AddForm()
+                    mode = MODE_ADD
                 elif key == "s":
                     is_running = state in ["RUNNING", "DOWNLOADING"]
                     override = "STOPPING..." if is_running else "STARTING..."
