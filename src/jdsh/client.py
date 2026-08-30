@@ -6,22 +6,26 @@ from . import config
 # only returns what is asked for.
 DOWNLOAD_PACKAGE_FIELDS = {
     "bytesLoaded": True, "bytesTotal": True, "childCount": True,
-    "enabled": True, "eta": True, "finished": True, "running": True,
-    "saveTo": True, "speed": True, "status": True,
+    "comment": True, "enabled": True, "eta": True, "finished": True,
+    "priority": True, "running": True, "saveTo": True, "speed": True,
+    "status": True,
 }
 DOWNLOAD_LINK_FIELDS = {
-    "bytesLoaded": True, "bytesTotal": True, "enabled": True, "eta": True,
-    "finished": True, "host": True, "packageUUID": True, "running": True,
-    "speed": True, "status": True, "url": True,
+    "addedDate": True, "bytesLoaded": True, "bytesTotal": True,
+    "comment": True, "enabled": True, "eta": True, "extractionStatus": True,
+    "finished": True, "finishedDate": True, "host": True, "packageUUID": True,
+    "priority": True, "running": True, "speed": True, "status": True,
+    "url": True,
 }
 GRABBER_PACKAGE_FIELDS = {
     "availableOnlineCount": True, "availableOfflineCount": True,
-    "bytesTotal": True, "childCount": True, "enabled": True,
-    "hosts": True, "saveTo": True, "status": True,
+    "bytesTotal": True, "childCount": True, "comment": True, "enabled": True,
+    "hosts": True, "priority": True, "saveTo": True, "status": True,
 }
 GRABBER_LINK_FIELDS = {
-    "availability": True, "bytesTotal": True, "enabled": True,
-    "host": True, "packageUUID": True, "status": True, "url": True,
+    "availability": True, "bytesTotal": True, "comment": True,
+    "enabled": True, "host": True, "packageUUID": True, "priority": True,
+    "status": True, "url": True,
 }
 
 
@@ -105,6 +109,36 @@ class JDClient:
             return state, active, pending
         except Exception:
             return "ERROR", [], []
+
+    # --- actions -----------------------------------------------------------
+    #
+    # Every action takes the ids of the selected links and packages, the way
+    # the API expects them, so the caller can act on either kind of row.
+
+    def _list(self, tab_is_grabber):
+        return self.device.linkgrabber if tab_is_grabber else self.device.downloads
+
+    def set_enabled(self, enable, link_ids, package_ids, grabber=False):
+        self._list(grabber).set_enabled(enable, link_ids, package_ids)
+
+    def force_download(self, link_ids, package_ids):
+        self.device.downloadcontroller.force_download(link_ids, package_ids)
+
+    def reset_links(self, link_ids, package_ids):
+        self.device.downloads.reset_links(link_ids, package_ids)
+
+    def remove(self, link_ids, package_ids, grabber=False):
+        self._list(grabber).remove_links(link_ids, package_ids)
+
+    def cleanup_finished(self, link_ids, package_ids):
+        """Delete finished entries, like the GUI's Cleanup submenu."""
+        self.device.downloads.cleanup(
+            "DELETE_FINISHED", "REMOVE_LINKS_ONLY", "SELECTED",
+            link_ids, package_ids,
+        )
+
+    def move_to_downloadlist(self, link_ids, package_ids):
+        self.device.linkgrabber.move_to_downloadlist(link_ids, package_ids)
 
     def move_to_downloads(self):
         """Confirm every LinkGrabber package, like the GUI's 'Continue' button."""
