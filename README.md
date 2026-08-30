@@ -114,8 +114,8 @@ You may uncomment any line and change when you need.
 
 # colours of the selected and of the marked rows, for themes the
 # defaults do not suit
-# SELECTION_STYLE = bold #ffffff on #1c3f6e
-# MARK_STYLE = #ffffff on #16293f
+# SELECTION_STYLE = bold #ffffff on #1f4f82
+# MARK_STYLE = #ffffff on #1a3350
 ```
 
 ---
