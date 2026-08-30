@@ -23,6 +23,9 @@ from rich import box
 
 from . import utils, config
 
+TAB_DOWNLOADS = 0
+TAB_LINKGRABBER = 1
+
 class KeyboardInput:
     def __enter__(self):
         if termios:
@@ -37,32 +40,72 @@ class KeyboardInput:
     def get_key(self):
         if termios:
             if select.select([sys.stdin], [], [], 0)[0]:
-                return sys.stdin.read(1)
-        
+                ch = sys.stdin.read(1)
+                if ch != "\x1b":
+                    return ch
+                # Arrow keys arrive as an escape sequence: ESC [ A/B/C/D
+                seq = ""
+                while select.select([sys.stdin], [], [], 0.01)[0] and len(seq) < 3:
+                    seq += sys.stdin.read(1)
+                return {"[A": "UP", "[B": "DOWN", "[C": "RIGHT", "[D": "LEFT"}.get(seq, "\x1b")
+
         elif msvcrt:
             if msvcrt.kbhit():
+                ch = msvcrt.getch()
+                if ch in (b"\x00", b"\xe0"):
+                    return {b"H": "UP", b"P": "DOWN", b"M": "RIGHT", b"K": "LEFT"}.get(msvcrt.getch())
                 try:
-                    return msvcrt.getch().decode("utf-8", errors="ignore")
-                except:
+                    return ch.decode("utf-8", errors="ignore")
+                except Exception:
                     pass
         return None
 
-def generate_layout(state, active_links, pending_links, override_status=None):
-    current_speed = sum(l.get('speed', 0) for l in active_links)
-    
-    total_bytes = sum(l.get('bytesTotal', 0) for l in active_links)
-    loaded_bytes = sum(l.get('bytesLoaded', 0) for l in active_links)
-    remaining_bytes = total_bytes - loaded_bytes
-    
-    # Header
+
+def _package_progress(pkg):
+    total = pkg.get("bytesTotal") or 0
+    done = pkg.get("bytesLoaded") or 0
+    if pkg.get("finished"):
+        return 100.0
+    if not total:
+        return 0.0
+    return min(100.0, (done / total) * 100)
+
+
+def _package_status(pkg):
+    if pkg.get("status"):
+        return pkg["status"]
+    if pkg.get("finished"):
+        return "Finished"
+    if pkg.get("running"):
+        return "Downloading"
+    if not pkg.get("enabled", True):
+        return "Disabled"
+    return "Queued"
+
+
+def _visible_window(rows, selected, height):
+    """Scroll the list so the selected row stays inside the viewport."""
+    if len(rows) <= height:
+        return rows, 0
+    start = max(0, min(selected - height // 2, len(rows) - height))
+    return rows[start:start + height], start
+
+
+def _header(state, downloads, override_status=None):
+    speed = sum(p.get("speed", 0) or 0 for p in downloads)
+    total_bytes = sum(p.get("bytesTotal", 0) or 0 for p in downloads)
+    loaded_bytes = sum(p.get("bytesLoaded", 0) or 0 for p in downloads)
+    remaining = max(0, total_bytes - loaded_bytes)
+    running = sum(1 for p in downloads if p.get("running"))
+    finished = sum(1 for p in downloads if p.get("finished"))
+
     grid = Table.grid(expand=True)
     grid.add_column(ratio=1)
     grid.add_column(ratio=1)
     grid.add_column(ratio=1)
 
     display_state = override_status if override_status else state
-    
-    # Colors
+
     if override_status:
         st_style, border_color = "bold yellow", "yellow"
     elif state in ["RUNNING", "DOWNLOADING"]:
@@ -74,119 +117,269 @@ def generate_layout(state, active_links, pending_links, override_status=None):
 
     grid.add_row(
         Text.assemble("State: ", (display_state, st_style)),
-        Text.assemble("Speed: ", (f"{utils.human_size(current_speed)}/s", "bold cyan")),
+        Text.assemble("Speed: ", (f"{utils.human_size(speed)}/s", "bold cyan")),
         f"[dim]Total:[/dim] {utils.human_size(total_bytes)}",
     )
     grid.add_row(
-        Text.assemble("Active: ", (str(len(active_links)), "bold white"), "  |  ", "Pending: ", (str(len(pending_links)), "dim white")),
-        f"[dim]Done: [/dim] {utils.human_size(loaded_bytes)}",
-        f"[dim]Left: [/dim] [yellow]{utils.human_size(remaining_bytes)}[/]"
+        Text.assemble(
+            "Packages: ", (str(len(downloads)), "bold white"),
+            "  |  Running: ", (str(running), "bold green"),
+            "  |  Done: ", (str(finished), "dim white"),
+        ),
+        f"[dim]Loaded:[/dim] {utils.human_size(loaded_bytes)}",
+        f"[dim]Left: [/dim] [yellow]{utils.human_size(remaining)}[/]",
     )
+    return Panel(grid, title="JDownloader Panel", border_style=border_color, box=box.ROUNDED), border_color
 
-    header = Panel(grid, title="JDownloader Panel", border_style=border_color, box=box.ROUNDED)
 
-    # Active Queue
-    t_active = Table(expand=True, box=box.SIMPLE, show_edge=False, pad_edge=False)
-    t_active.add_column("Name", ratio=3, no_wrap=True)
-    t_active.add_column("Progress", ratio=2) 
-    t_active.add_column("%", width=5, justify="right")
-    t_active.add_column("Size (Done/Total)", width=20, justify="right", style="dim")
-    t_active.add_column("Speed", width=12, justify="right", style="cyan")
-    t_active.add_column("ETA", width=10, justify="right", style="green")
+def _tab_bar(tab, downloads, grabber):
+    def render(label, count, active):
+        style = "bold black on bright_cyan" if active else "dim"
+        return Text(f" {label} ({count}) ", style=style)
 
-    if not active_links:
-        t_active.add_row("[dim italic]No active downloads[/]", "", "", "", "-", "-")
-    else:
-        for l in active_links:
-            total = l.get('bytesTotal', 1) or 1
-            done = l.get('bytesLoaded', 0)
-            pct = (done / total) * 100
-            
+    bar = Table.grid(expand=True)
+    bar.add_column(justify="left")
+    bar.add_row(Text.assemble(
+        render("Downloads", len(downloads), tab == TAB_DOWNLOADS),
+        "  ",
+        render("Link Grabber", len(grabber), tab == TAB_LINKGRABBER),
+        ("   Tab to switch", "dim"),
+    ))
+    return bar
+
+
+def _downloads_table(packages, selected, expanded, height):
+    t = Table(expand=True, box=box.SIMPLE, show_edge=False, pad_edge=False)
+    t.add_column("Name", ratio=3, no_wrap=True)
+    t.add_column("Links", width=6, justify="right", style="dim")
+    t.add_column("Size", width=20, justify="right", style="dim")
+    t.add_column("Status", ratio=1, no_wrap=True, style="yellow")
+    t.add_column("Progress", width=18)
+    t.add_column("%", width=5, justify="right")
+    t.add_column("Speed", width=12, justify="right", style="cyan")
+    t.add_column("ETA", width=9, justify="right", style="green")
+
+    if not packages:
+        t.add_row("[dim italic]No packages in the download list[/]", "", "", "", "", "", "-", "-")
+        return t
+
+    rows = []
+    for idx, pkg in enumerate(packages):
+        rows.append(("pkg", idx, pkg))
+        if pkg.get("uuid") in expanded:
+            for link in pkg.get("_links", []):
+                rows.append(("link", idx, link))
+
+    # Keep the selected package visible while scrolling.
+    selected_row = next((i for i, r in enumerate(rows) if r[0] == "pkg" and r[1] == selected), 0)
+    window, _ = _visible_window(rows, selected_row, height)
+
+    for kind, idx, item in window:
+        if kind == "pkg":
+            pct = _package_progress(item)
+            marker = "▼" if item.get("uuid") in expanded else "▶"
+            name = Text(f"{marker} {item.get('name', '?')}")
+            if idx == selected:
+                name.stylize("bold black on bright_cyan")
             bar = ProgressBar(
-                total=100, completed=pct, width=None, style="grey23", 
-                complete_style="bold bright_cyan", finished_style="bold bright_green"
+                total=100, completed=pct, width=None, style="grey23",
+                complete_style="bold bright_cyan", finished_style="bold bright_green",
             )
-            
-            size_str = f"{utils.human_size(done)}/{utils.human_size(total)}"
-            
-            t_active.add_row(
-                l['name'], 
-                bar, 
-                f"{pct:.0f}%", 
-                size_str,
-                f"{utils.human_size(l.get('speed', 0))}/s", 
-                utils.human_eta(l.get('eta', 0))
+            t.add_row(
+                name,
+                f"[{item.get('childCount', 0)}]",
+                f"{utils.human_size(item.get('bytesLoaded', 0))}/{utils.human_size(item.get('bytesTotal', 0))}",
+                _package_status(item),
+                bar,
+                f"{pct:.0f}%",
+                f"{utils.human_size(item.get('speed', 0))}/s" if item.get("speed") else "-",
+                utils.human_eta(item.get("eta", 0)),
             )
+        else:
+            pct = 100.0 if item.get("finished") else (
+                (item.get("bytesLoaded", 0) / item["bytesTotal"]) * 100
+                if item.get("bytesTotal") else 0.0
+            )
+            t.add_row(
+                Text(f"    └ {item.get('name', '?')}", style="dim"),
+                "",
+                f"{utils.human_size(item.get('bytesLoaded', 0))}/{utils.human_size(item.get('bytesTotal', 0))}",
+                Text(item.get("status") or "-", style="dim"),
+                "",
+                f"[dim]{pct:.0f}%[/]",
+                f"{utils.human_size(item.get('speed', 0))}/s" if item.get("speed") else "",
+                "",
+            )
+    return t
 
-    panel_active = Panel(t_active, title="Active Queue", border_style="white", box=box.ROUNDED)
 
-    # Pending Queue
-    t_pending = Table(expand=True, box=box.SIMPLE, show_edge=False, pad_edge=False)
-    t_pending.add_column("Name", ratio=1, no_wrap=True)
-    t_pending.add_column("Status", ratio=1, style="yellow")
-    t_pending.add_column("Total Size", width=24, justify="right", style="dim")
+def _grabber_table(packages, selected, expanded, height):
+    t = Table(expand=True, box=box.SIMPLE, show_edge=False, pad_edge=False)
+    t.add_column("Name", ratio=3, no_wrap=True)
+    t.add_column("Links", width=6, justify="right", style="dim")
+    t.add_column("Size", width=12, justify="right", style="dim")
+    t.add_column("Online", width=8, justify="right", style="green")
+    t.add_column("Offline", width=8, justify="right", style="red")
+    t.add_column("Hoster", ratio=1, no_wrap=True, style="magenta")
+    t.add_column("Save to", ratio=2, no_wrap=True, style="dim")
 
-    if not pending_links:
-        t_pending.add_row("[dim italic]No pending items[/]", "-", "-")
+    if not packages:
+        t.add_row("[dim italic]LinkGrabber is empty[/]", "", "", "", "", "", "")
+        return t
+
+    rows = []
+    for idx, pkg in enumerate(packages):
+        rows.append(("pkg", idx, pkg))
+        if pkg.get("uuid") in expanded:
+            for link in pkg.get("_links", []):
+                rows.append(("link", idx, link))
+
+    selected_row = next((i for i, r in enumerate(rows) if r[0] == "pkg" and r[1] == selected), 0)
+    window, _ = _visible_window(rows, selected_row, height)
+
+    for kind, idx, item in window:
+        if kind == "pkg":
+            marker = "▼" if item.get("uuid") in expanded else "▶"
+            name = Text(f"{marker} {item.get('name', '?')}")
+            if idx == selected:
+                name.stylize("bold black on bright_cyan")
+            hosts = item.get("hosts") or []
+            t.add_row(
+                name,
+                f"[{item.get('childCount', 0)}]",
+                utils.human_size(item.get("bytesTotal", 0)),
+                str(item.get("availableOnlineCount", "-")),
+                str(item.get("availableOfflineCount", "-")),
+                ", ".join(hosts) if hosts else "-",
+                item.get("saveTo", "-"),
+            )
+        else:
+            availability = item.get("availability", "-")
+            style = "green" if availability == "ONLINE" else "red"
+            t.add_row(
+                Text(f"    └ {item.get('name', '?')}", style="dim"),
+                "",
+                utils.human_size(item.get("bytesTotal", 0)),
+                Text(availability, style=style),
+                "",
+                item.get("host", "-"),
+                Text(item.get("url", "") or "", style="dim"),
+            )
+    return t
+
+
+def generate_layout(state, downloads, grabber, tab=TAB_DOWNLOADS, selected=0,
+                    expanded=frozenset(), body_height=20, override_status=None):
+    header, border_color = _header(state, downloads, override_status)
+
+    if tab == TAB_DOWNLOADS:
+        table = _downloads_table(downloads, selected, expanded, body_height)
+        title = "Downloads"
     else:
-        limit = 10
-        for l in pending_links[:limit]:
-            t_pending.add_row(
-                l['name'],
-                l.get('status', 'Pending'),
-                utils.human_size(l.get('bytesTotal', 0))
-            )
-        if len(pending_links) > limit:
-            t_pending.add_row(f"[italic]...and {len(pending_links)-limit} more[/]", "", "")
+        table = _grabber_table(grabber, selected, expanded, body_height)
+        title = "Link Grabber"
 
-    panel_pending = Panel(t_pending, title="Pending Queue", border_style="dim white", box=box.ROUNDED)
+    body = Panel(table, title=title, border_style=border_color, box=box.ROUNDED)
 
-    # Footer
-    footer = Align.center("[dim]Press [bold white]s[/] to Start/Stop  |  [bold white]Ctrl+C[/] to Quit[/]")
+    footer = Align.center(
+        "[dim][bold white]Tab[/] switch  |  [bold white]↑↓[/] select  |  "
+        "[bold white]→/Enter[/] expand  |  [bold white]s[/] start/stop  |  "
+        "[bold white]c[/] confirm grabber  |  [bold white]q[/] quit[/]"
+    )
 
     layout = Layout()
     layout.split(
         Layout(header, size=4),
-        Layout(panel_active, ratio=2), # Active takes more space
-        Layout(panel_pending, ratio=1),
-        Layout(footer, size=1)
+        Layout(_tab_bar(tab, downloads, grabber), size=1),
+        Layout(body, ratio=1),
+        Layout(footer, size=1),
     )
     return layout
+
 
 def run(client):
     console = Console()
     console.clear()
-    last_state, last_active, last_pending = "UNKNOWN", [], []
+
+    state, downloads, grabber = "UNKNOWN", [], []
+    tab = TAB_DOWNLOADS
+    selected = 0
+    expanded = set()
+    override = None
+
+    def current_packages():
+        return downloads if tab == TAB_DOWNLOADS else grabber
+
+    def body_height():
+        # Panel borders, header, tab bar and footer take a fixed slice.
+        return max(3, console.size.height - 12)
+
+    def draw(live):
+        live.update(generate_layout(
+            state, downloads, grabber, tab, selected, expanded,
+            body_height(), override,
+        ))
 
     try:
         with KeyboardInput() as kbd, Live(refresh_per_second=4, screen=True) as live:
             live.update(generate_layout("CONNECTING...", [], [], override_status="LOADING..."))
-            
-            last_state, last_active, last_pending = client.fetch_stats()
-            live.update(generate_layout(last_state, last_active, last_pending))
+            state, downloads, grabber = client.fetch_overview()
+            draw(live)
 
             while True:
                 start_time = time.time()
                 while (time.time() - start_time) < config.REFRESH_RATE:
                     key = kbd.get_key()
-                    if key == 's':
-                        is_running = last_state in ["RUNNING", "DOWNLOADING"]
-                        fb_status = "STOPPING..." if is_running else "STARTING..."
-                        
-                        live.update(generate_layout(last_state, last_active, last_pending, override_status=fb_status))
-                        
-                        try: client.toggle_state(last_state)
-                        except: pass
-                        
-                        break
-                    
-                    if key: pass 
-                    time.sleep(0.1)
+                    if not key:
+                        time.sleep(0.05)
+                        continue
 
-                state, active, pending = client.fetch_stats()
-                last_state, last_active, last_pending = state, active, pending
-                
-                live.update(generate_layout(state, active, pending))
+                    if key in ("q", "Q"):
+                        return
+
+                    if key == "\t":
+                        tab = TAB_LINKGRABBER if tab == TAB_DOWNLOADS else TAB_DOWNLOADS
+                        selected = 0
+                    elif key in ("UP", "k"):
+                        selected = max(0, selected - 1)
+                    elif key in ("DOWN", "j"):
+                        selected = min(max(0, len(current_packages()) - 1), selected + 1)
+                    elif key in ("RIGHT", "\r", "\n", " "):
+                        packages = current_packages()
+                        if packages and selected < len(packages):
+                            uuid = packages[selected].get("uuid")
+                            expanded.symmetric_difference_update({uuid})
+                    elif key == "LEFT":
+                        packages = current_packages()
+                        if packages and selected < len(packages):
+                            expanded.discard(packages[selected].get("uuid"))
+                    elif key == "s":
+                        is_running = state in ["RUNNING", "DOWNLOADING"]
+                        override = "STOPPING..." if is_running else "STARTING..."
+                        draw(live)
+                        try:
+                            client.toggle_state(state)
+                        except Exception:
+                            pass
+                        override = None
+                        break
+                    elif key == "c" and tab == TAB_LINKGRABBER:
+                        override = "CONFIRMING..."
+                        draw(live)
+                        try:
+                            client.move_to_downloads()
+                        except Exception:
+                            pass
+                        override = None
+                        break
+                    else:
+                        continue
+
+                    draw(live)
+
+                state, downloads, grabber = client.fetch_overview()
+                selected = min(selected, max(0, len(current_packages()) - 1))
+                draw(live)
 
     except KeyboardInterrupt:
         pass
