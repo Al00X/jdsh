@@ -1,5 +1,6 @@
 import os
 import re
+import threading
 import time
 import sys
 
@@ -503,6 +504,41 @@ def generate_layout(state, downloads, grabber, rows=None, tab=TAB_DOWNLOADS, cur
     return layout
 
 
+class Poller(threading.Thread):
+    """Poll the device off the main thread.
+
+    Each refresh costs a few hundred milliseconds over the network, and doing
+    it inline made the interface swallow keystrokes for that whole window.
+    """
+
+    def __init__(self, client, api_lock, interval):
+        super().__init__(daemon=True)
+        self.client = client
+        self.api_lock = api_lock
+        self.interval = interval
+        self._stop = threading.Event()
+        self._data_lock = threading.Lock()
+        self._data = ("UNKNOWN", [], [])
+        self.version = 0
+
+    def run(self):
+        while not self._stop.is_set():
+            with self.api_lock:
+                data = self.client.fetch_overview()
+            with self._data_lock:
+                self._data = data
+                self.version += 1
+            if self._stop.wait(self.interval):
+                break
+
+    def snapshot(self):
+        with self._data_lock:
+            return self._data
+
+    def stop(self):
+        self._stop.set()
+
+
 def run(client):
     console = Console()
     console.clear()
@@ -533,7 +569,7 @@ def run(client):
         live.update(generate_layout(
             state, downloads, grabber, rows, tab, cursor, expanded,
             body_height(), override, mode, menu, menu_index, message,
-        ))
+        ), refresh=True)
 
     def current_row():
         return rows[cursor] if rows and cursor < len(rows) else None
@@ -556,118 +592,127 @@ def run(client):
             mode = MODE_PROPERTIES
             return
         try:
-            message = run_action(client, tab, row, action)
+            with api_lock:
+                message = run_action(client, tab, row, action)
         except Exception as exc:
             message = f"Failed: {exc}"
         mode = MODE_LIST
 
+    api_lock = threading.Lock()
+    poller = Poller(client, api_lock, config.REFRESH_RATE)
+
+    def call(fn, *args, **kwargs):
+        """Run an API call without racing the poller."""
+        with api_lock:
+            return fn(*args, **kwargs)
+
     try:
-        with KeyboardInput() as kbd, Live(refresh_per_second=4, screen=True) as live:
-            live.update(generate_layout("CONNECTING...", [], [], override_status="LOADING..."))
+        with KeyboardInput() as kbd, Live(refresh_per_second=30, screen=True) as live:
+            live.update(generate_layout("CONNECTING...", [], [], override_status="LOADING..."), refresh=True)
             state, downloads, grabber = client.fetch_overview()
             rebuild()
             draw(live)
+            poller.start()
+            seen_version = poller.version
 
             while True:
-                start_time = time.time()
-                while (time.time() - start_time) < config.REFRESH_RATE:
-                    key = kbd.get_key()
-                    if not key:
-                        time.sleep(0.05)
-                        continue
+                key = kbd.get_key()
 
-                    if mode == MODE_CONFIRM:
-                        if key in ("y", "Y"):
-                            execute(pending)
-                        else:
-                            message = "Cancelled"
-                        pending, mode = None, MODE_LIST
-                        draw(live)
-                        continue
-
-                    if mode == MODE_PROPERTIES:
-                        if key in ("\x1b", "q", "Q", "p", "\r", "\n"):
-                            mode = MODE_LIST
-                        draw(live)
-                        continue
-
-                    if mode == MODE_MENU:
-                        if key in ("\x1b", "q", "Q", "LEFT"):
-                            mode = MODE_LIST
-                        elif key in ("UP", "k"):
-                            menu_index = max(0, menu_index - 1)
-                        elif key in ("DOWN", "j"):
-                            menu_index = min(len(menu) - 1, menu_index + 1)
-                        elif key in ("\r", "\n", "RIGHT", " "):
-                            entry = menu[menu_index]
-                            if entry.confirm:
-                                pending = entry.action
-                                mode = MODE_CONFIRM
-                                message = f"{entry.label} '{current_row().name[:40]}'?  [y/N]"
-                            else:
-                                execute(entry.action)
-                        draw(live)
-                        continue
-
-                    # --- list mode
-                    if key in ("q", "Q"):
-                        return
-
-                    message = ""
-                    if key == "\t":
-                        tab = TAB_LINKGRABBER if tab == TAB_DOWNLOADS else TAB_DOWNLOADS
-                        cursor = 0
+                if key is None:
+                    if poller.version != seen_version:
+                        seen_version = poller.version
+                        state, downloads, grabber = poller.snapshot()
                         rebuild()
-                    elif key in ("UP", "k"):
-                        cursor = max(0, cursor - 1)
-                    elif key in ("DOWN", "j"):
-                        cursor = min(max(0, len(rows) - 1), cursor + 1)
-                    elif key in ("RIGHT", " "):
-                        toggle_expand(current_row())
-                    elif key == "LEFT":
-                        row = current_row()
-                        if row is not None and not row.is_package:
-                            # Step out of an expanded package.
-                            cursor = rows.index(next(r for r in rows if r.item is row.parent))
-                        elif row is not None:
-                            expanded.discard(row.uuid)
-                            rebuild()
-                    elif key in ("\r", "\n"):
-                        row = current_row()
-                        if row is not None:
-                            menu = context_menu(tab, row)
-                            menu_index = 0
-                            mode = MODE_MENU
-                    elif key in ("p", "P"):
-                        if current_row() is not None:
-                            mode = MODE_PROPERTIES
-                    elif key == "s":
-                        is_running = state in ["RUNNING", "DOWNLOADING"]
-                        override = "STOPPING..." if is_running else "STARTING..."
                         draw(live)
-                        try:
-                            client.toggle_state(state)
-                        except Exception:
-                            pass
-                        override = None
-                        break
-                    elif key == "c" and tab == TAB_LINKGRABBER:
-                        override = "CONFIRMING..."
-                        draw(live)
-                        try:
-                            client.move_to_downloads()
-                        except Exception:
-                            pass
-                        override = None
-                        break
+                    time.sleep(0.01)
+                    continue
+
+                if mode == MODE_CONFIRM:
+                    if key in ("y", "Y"):
+                        execute(pending)
                     else:
-                        continue
-
+                        message = "Cancelled"
+                    pending, mode = None, MODE_LIST
                     draw(live)
+                    continue
 
-                state, downloads, grabber = client.fetch_overview()
-                rebuild()
+                if mode == MODE_PROPERTIES:
+                    if key in ("\x1b", "q", "Q", "p", "\r", "\n"):
+                        mode = MODE_LIST
+                    draw(live)
+                    continue
+
+                if mode == MODE_MENU:
+                    if key in ("\x1b", "q", "Q", "LEFT"):
+                        mode = MODE_LIST
+                    elif key in ("UP", "k"):
+                        menu_index = max(0, menu_index - 1)
+                    elif key in ("DOWN", "j"):
+                        menu_index = min(len(menu) - 1, menu_index + 1)
+                    elif key in ("\r", "\n", "RIGHT", " "):
+                        entry = menu[menu_index]
+                        if entry.confirm:
+                            pending = entry.action
+                            mode = MODE_CONFIRM
+                            message = f"{entry.label} '{current_row().name[:40]}'?  [y/N]"
+                        else:
+                            execute(entry.action)
+                    draw(live)
+                    continue
+
+                # --- list mode
+                if key in ("q", "Q"):
+                    return
+
+                message = ""
+                if key == "\t":
+                    tab = TAB_LINKGRABBER if tab == TAB_DOWNLOADS else TAB_DOWNLOADS
+                    cursor = 0
+                    rebuild()
+                elif key in ("UP", "k"):
+                    cursor = max(0, cursor - 1)
+                elif key in ("DOWN", "j"):
+                    cursor = min(max(0, len(rows) - 1), cursor + 1)
+                elif key in ("RIGHT", " "):
+                    toggle_expand(current_row())
+                elif key == "LEFT":
+                    row = current_row()
+                    if row is not None and not row.is_package:
+                        # Step out of an expanded package.
+                        cursor = rows.index(next(r for r in rows if r.item is row.parent))
+                    elif row is not None:
+                        expanded.discard(row.uuid)
+                        rebuild()
+                elif key in ("\r", "\n"):
+                    row = current_row()
+                    if row is not None:
+                        menu = context_menu(tab, row)
+                        menu_index = 0
+                        mode = MODE_MENU
+                elif key in ("p", "P"):
+                    if current_row() is not None:
+                        mode = MODE_PROPERTIES
+                elif key == "s":
+                    is_running = state in ["RUNNING", "DOWNLOADING"]
+                    override = "STOPPING..." if is_running else "STARTING..."
+                    draw(live)
+                    try:
+                        call(client.toggle_state, state)
+                    except Exception:
+                        pass
+                    override = None
+                elif key == "c" and tab == TAB_LINKGRABBER:
+                    override = "CONFIRMING..."
+                    draw(live)
+                    try:
+                        call(client.move_to_downloads)
+                    except Exception:
+                        pass
+                    override = None
+
                 draw(live)
 
     except KeyboardInterrupt:
         pass
+    finally:
+        poller.stop()
