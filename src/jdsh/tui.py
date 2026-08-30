@@ -1,3 +1,6 @@
+import os
+import re
+import threading
 import time
 import sys
 
@@ -23,7 +26,33 @@ from rich import box
 
 from . import utils, config
 
+TAB_DOWNLOADS = 0
+TAB_LINKGRABBER = 1
+
+MODE_LIST = "list"
+MODE_MENU = "menu"
+MODE_PROPERTIES = "properties"
+MODE_CONFIRM = "confirm"
+MODE_ADD = "add"
+
+# Palette names are remapped by the terminal theme, which can turn a "blue"
+# background into a light one and leave white text unreadable on top of it.
+# Both ends of the pair are pinned, and the selection is configurable.
+SELECTED_STYLE = config.SELECTION_STYLE
+MARKED_STYLE = config.MARK_STYLE
+TAB_ACTIVE_STYLE = "bold #10161f on #7cc7ff"
+
+
 class KeyboardInput:
+    # Cursor keys arrive as an escape sequence: ESC followed by '[' or 'O'
+    # (the latter when the terminal is in application cursor mode, which is
+    # common on an alternate screen) and a final letter.
+    ARROWS = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}
+    ESCAPE_SEQUENCE = re.compile(r"\x1b[\[O]([A-D])")
+
+    def __init__(self):
+        self._pending = ""
+
     def __enter__(self):
         if termios:
             self.old_settings = termios.tcgetattr(sys.stdin)
@@ -34,35 +63,355 @@ class KeyboardInput:
         if termios:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
 
+    def _drain(self):
+        """Read straight from the file descriptor.
+
+        Reading through sys.stdin would pull the whole escape sequence into
+        Python's own buffer while select() still reports the descriptor as
+        empty, leaving the rest of the sequence stranded.
+        """
+        while select.select([sys.stdin], [], [], 0)[0]:
+            data = os.read(sys.stdin.fileno(), 1024)
+            if not data:
+                break
+            self._pending += data.decode("utf-8", errors="ignore")
+
     def get_key(self):
         if termios:
-            if select.select([sys.stdin], [], [], 0)[0]:
-                return sys.stdin.read(1)
-        
+            self._drain()
+            if not self._pending:
+                return None
+
+            if not self._pending.startswith("\x1b"):
+                key, self._pending = self._pending[0], self._pending[1:]
+                return key
+
+            match = self.ESCAPE_SEQUENCE.match(self._pending)
+            if match:
+                self._pending = self._pending[match.end():]
+                return self.ARROWS[match.group(1)]
+
+            # A bare ESC, or a sequence we do not handle: drop one character.
+            self._pending = self._pending[1:]
+            return "\x1b"
+
         elif msvcrt:
             if msvcrt.kbhit():
+                ch = msvcrt.getch()
+                if ch in (b"\x00", b"\xe0"):
+                    return {b"H": "UP", b"P": "DOWN", b"M": "RIGHT", b"K": "LEFT"}.get(msvcrt.getch())
                 try:
-                    return msvcrt.getch().decode("utf-8", errors="ignore")
-                except:
+                    return ch.decode("utf-8", errors="ignore")
+                except Exception:
                     pass
         return None
 
-def generate_layout(state, active_links, pending_links, override_status=None):
-    current_speed = sum(l.get('speed', 0) for l in active_links)
-    
-    total_bytes = sum(l.get('bytesTotal', 0) for l in active_links)
-    loaded_bytes = sum(l.get('bytesLoaded', 0) for l in active_links)
-    remaining_bytes = total_bytes - loaded_bytes
-    
-    # Header
+
+# --- rows -------------------------------------------------------------------
+#
+# Packages and their links share one flat list, so the cursor can walk over
+# both, the way the tree in the GUI does.
+
+class Row:
+    __slots__ = ("kind", "item", "parent")
+
+    def __init__(self, kind, item, parent=None):
+        self.kind = kind          # "pkg" or "link"
+        self.item = item
+        self.parent = parent      # the package a link belongs to
+
+    @property
+    def is_package(self):
+        return self.kind == "pkg"
+
+    @property
+    def uuid(self):
+        return self.item.get("uuid")
+
+    @property
+    def name(self):
+        return self.item.get("name", "?")
+
+    @property
+    def key(self):
+        """Identity used by the marking set: uuids repeat across kinds."""
+        return (self.kind, self.uuid)
+
+    def ids(self):
+        """(link_ids, package_ids) as the API expects them."""
+        if self.is_package:
+            return [], [self.uuid]
+        return [self.uuid], []
+
+
+def build_rows(packages, expanded):
+    rows = []
+    for pkg in packages:
+        rows.append(Row("pkg", pkg))
+        if pkg.get("uuid") in expanded:
+            for link in pkg.get("_links", []):
+                rows.append(Row("link", link, pkg))
+    return rows
+
+
+# --- context menu -----------------------------------------------------------
+
+class MenuEntry:
+    def __init__(self, label, action, confirm=False):
+        self.label = label
+        self.action = action
+        self.confirm = confirm
+
+
+def collect_ids(rows):
+    """(link_ids, package_ids) for a whole selection."""
+    link_ids = [r.uuid for r in rows if not r.is_package]
+    package_ids = [r.uuid for r in rows if r.is_package]
+    return link_ids, package_ids
+
+
+def describe(rows):
+    if len(rows) == 1:
+        return "Package" if rows[0].is_package else "Link"
+    packages = sum(1 for r in rows if r.is_package)
+    links = len(rows) - packages
+    parts = []
+    if packages:
+        parts.append(f"{packages} package{'s' if packages > 1 else ''}")
+    if links:
+        parts.append(f"{links} link{'s' if links > 1 else ''}")
+    return " + ".join(parts)
+
+
+def context_menu(tab, rows):
+    """The actions the API actually supports for this selection."""
+    single = rows[0] if len(rows) == 1 else None
+    # Disable only makes sense while something is still enabled.
+    any_enabled = any(r.item.get("enabled", True) for r in rows)
+    suffix = "" if single else " all"
+    toggle = MenuEntry(("Disable" if any_enabled else "Enable") + suffix, "toggle_enabled")
+
+    if tab == TAB_LINKGRABBER:
+        entries = [
+            MenuEntry("Move to download list" + suffix, "move_to_downloads"),
+            toggle,
+            MenuEntry("Remove" + suffix, "remove", confirm=True),
+        ]
+    else:
+        entries = [
+            MenuEntry("Force download" + suffix, "force"),
+            toggle,
+            MenuEntry("Reset" + suffix, "reset", confirm=True),
+            MenuEntry("Remove" + suffix, "remove", confirm=True),
+        ]
+        if any(r.is_package for r in rows):
+            entries.insert(3, MenuEntry("Delete finished links", "cleanup", confirm=True))
+
+    if single is not None and single.is_package:
+        entries.insert(0, MenuEntry("Collapse / Expand", "expand"))
+
+    if single is not None:
+        entries.append(MenuEntry("Properties", "properties"))
+    return entries
+
+
+def run_action(client, tab, rows, action):
+    """Perform one menu action on the selection. Returns a footer message."""
+    link_ids, package_ids = collect_ids(rows)
+    grabber = tab == TAB_LINKGRABBER
+    what = describe(rows)
+
+    if action == "toggle_enabled":
+        # Mixed selections are switched off first, matching the menu label.
+        enable = not any(r.item.get("enabled", True) for r in rows)
+        client.set_enabled(enable, link_ids, package_ids, grabber=grabber)
+        return f"{what} {'enabled' if enable else 'disabled'}"
+
+    if action == "force":
+        client.force_download(link_ids, package_ids)
+        return f"{what} forced to start"
+
+    if action == "reset":
+        client.reset_links(link_ids, package_ids)
+        return f"{what} reset"
+
+    if action == "remove":
+        client.remove(link_ids, package_ids, grabber=grabber)
+        return f"{what} removed"
+
+    if action == "cleanup":
+        client.cleanup_finished(link_ids, package_ids)
+        return "Finished links deleted"
+
+    if action == "move_to_downloads":
+        client.move_to_downloadlist(link_ids, package_ids)
+        return f"{what} moved to the download list"
+
+    return ""
+
+
+def properties(row):
+    """Key/value pairs worth showing, skipping what the API did not return."""
+    item = row.item
+    fields = [
+        ("Name", item.get("name")),
+        ("UUID", item.get("uuid")),
+        ("Type", "Package" if row.is_package else "Link"),
+        ("Status", item.get("status")),
+        ("Extraction", item.get("extractionStatus")),
+        ("Size", utils.human_size(item.get("bytesTotal", 0))),
+        ("Loaded", utils.human_size(item.get("bytesLoaded", 0)) if "bytesLoaded" in item else None),
+        ("Links", item.get("childCount")),
+        ("Online / Offline", None if item.get("availableOnlineCount") is None
+         else f"{item.get('availableOnlineCount')} / {item.get('availableOfflineCount', 0)}"),
+        ("Availability", item.get("availability")),
+        ("Host", item.get("host") or (", ".join(item["hosts"]) if item.get("hosts") else None)),
+        ("Enabled", "yes" if item.get("enabled", True) else "no"),
+        ("Priority", item.get("priority")),
+        ("Speed", f"{utils.human_size(item['speed'])}/s" if item.get("speed") else None),
+        ("ETA", utils.human_eta(item["eta"]) if item.get("eta") else None),
+        ("Save to", item.get("saveTo") or (row.parent.get("saveTo") if row.parent else None)),
+        ("URL", item.get("url")),
+        ("Comment", item.get("comment")),
+    ]
+    return [(k, str(v)) for k, v in fields if v not in (None, "", [])]
+
+
+# --- add links form ---------------------------------------------------------
+
+PRIORITIES = ["HIGHEST", "HIGHER", "HIGH", "DEFAULT", "LOW", "LOWER", "LOWEST"]
+
+
+class AddForm:
+    """The fields of the GUI's "Analyse and add links" dialog."""
+
+    FIELDS = [
+        ("links", "Links", "text"),
+        ("package_name", "Package name", "text"),
+        ("destination", "Save to", "text"),
+        ("extract_password", "Extract password", "text"),
+        ("download_password", "Download password", "text"),
+        ("priority", "Priority", "choice"),
+        ("autostart", "Autostart", "flag"),
+    ]
+    HINTS = {
+        "links": "one or more urls, separated by spaces",
+        "package_name": "leave empty for automatic",
+        "destination": "leave empty for the default folder",
+    }
+
+    def __init__(self):
+        self.values = {name: "" for name, _, kind in self.FIELDS if kind == "text"}
+        self.values["priority"] = "DEFAULT"
+        self.values["autostart"] = False
+        self.index = 0
+
+    @property
+    def field(self):
+        return self.FIELDS[self.index]
+
+    def move(self, delta):
+        self.index = (self.index + delta) % len(self.FIELDS)
+
+    def type(self, text):
+        name, _, kind = self.field
+        if kind == "text":
+            self.values[name] += text
+
+    def backspace(self):
+        name, _, kind = self.field
+        if kind == "text":
+            self.values[name] = self.values[name][:-1]
+
+    def cycle(self, delta):
+        name, _, kind = self.field
+        if kind == "choice":
+            i = PRIORITIES.index(self.values[name])
+            self.values[name] = PRIORITIES[(i + delta) % len(PRIORITIES)]
+        elif kind == "flag":
+            self.values[name] = not self.values[name]
+
+    @property
+    def is_valid(self):
+        return bool(self.values["links"].strip())
+
+
+def _add_panel(form):
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style="dim", justify="right", width=18)
+    t.add_column(overflow="fold")
+
+    for i, (name, label, kind) in enumerate(form.FIELDS):
+        active = i == form.index
+        value = form.values[name]
+        if kind == "flag":
+            shown = Text("[x] yes" if value else "[ ] no")
+        elif kind == "choice":
+            shown = Text(f"\u2039 {value} \u203a")
+        else:
+            shown = Text(value or "")
+            if not value and not active and name in form.HINTS:
+                shown = Text(form.HINTS[name], style="dim italic")
+            if active:
+                shown.append("\u258f")
+        if active:
+            shown.stylize(SELECTED_STYLE)
+        t.add_row(Text(label, style="bold" if active else "dim"), shown)
+
+    hint = "Enter add \u00b7 Tab/\u2191\u2193 field \u00b7 \u2190\u2192 change \u00b7 Esc cancel"
+    if not form.is_valid:
+        hint = "Paste at least one url \u00b7 " + hint
+    return Panel(t, title="Add links to the Link Grabber", subtitle=f"[dim]{hint}[/]",
+                 border_style="bright_cyan", box=box.ROUNDED, padding=(1, 2))
+
+
+# --- rendering --------------------------------------------------------------
+
+def _package_progress(pkg):
+    total = pkg.get("bytesTotal") or 0
+    done = pkg.get("bytesLoaded") or 0
+    if pkg.get("finished"):
+        return 100.0
+    if not total:
+        return 0.0
+    return min(100.0, (done / total) * 100)
+
+
+def _package_status(pkg):
+    if pkg.get("status"):
+        return pkg["status"]
+    if pkg.get("finished"):
+        return "Finished"
+    if pkg.get("running"):
+        return "Downloading"
+    if not pkg.get("enabled", True):
+        return "Disabled"
+    return "Queued"
+
+
+def _visible_window(rows, cursor, height):
+    """Scroll the list so the cursor stays inside the viewport."""
+    if len(rows) <= height:
+        return rows, 0
+    start = max(0, min(cursor - height // 2, len(rows) - height))
+    return rows[start:start + height], start
+
+
+def _header(state, downloads, override_status=None):
+    speed = sum(p.get("speed", 0) or 0 for p in downloads)
+    total_bytes = sum(p.get("bytesTotal", 0) or 0 for p in downloads)
+    loaded_bytes = sum(p.get("bytesLoaded", 0) or 0 for p in downloads)
+    remaining = max(0, total_bytes - loaded_bytes)
+    running = sum(1 for p in downloads if p.get("running"))
+    finished = sum(1 for p in downloads if p.get("finished"))
+
     grid = Table.grid(expand=True)
     grid.add_column(ratio=1)
     grid.add_column(ratio=1)
     grid.add_column(ratio=1)
 
     display_state = override_status if override_status else state
-    
-    # Colors
+
     if override_status:
         st_style, border_color = "bold yellow", "yellow"
     elif state in ["RUNNING", "DOWNLOADING"]:
@@ -74,119 +423,518 @@ def generate_layout(state, active_links, pending_links, override_status=None):
 
     grid.add_row(
         Text.assemble("State: ", (display_state, st_style)),
-        Text.assemble("Speed: ", (f"{utils.human_size(current_speed)}/s", "bold cyan")),
+        Text.assemble("Speed: ", (f"{utils.human_size(speed)}/s", "bold cyan")),
         f"[dim]Total:[/dim] {utils.human_size(total_bytes)}",
     )
     grid.add_row(
-        Text.assemble("Active: ", (str(len(active_links)), "bold white"), "  |  ", "Pending: ", (str(len(pending_links)), "dim white")),
-        f"[dim]Done: [/dim] {utils.human_size(loaded_bytes)}",
-        f"[dim]Left: [/dim] [yellow]{utils.human_size(remaining_bytes)}[/]"
+        Text.assemble(
+            "Packages: ", (str(len(downloads)), "bold white"),
+            "  |  Running: ", (str(running), "bold green"),
+            "  |  Done: ", (str(finished), "dim white"),
+        ),
+        f"[dim]Loaded:[/dim] {utils.human_size(loaded_bytes)}",
+        f"[dim]Left: [/dim] [yellow]{utils.human_size(remaining)}[/]",
     )
+    return Panel(grid, title="JDownloader Panel", border_style=border_color, box=box.ROUNDED), border_color
 
-    header = Panel(grid, title="JDownloader Panel", border_style=border_color, box=box.ROUNDED)
 
-    # Active Queue
-    t_active = Table(expand=True, box=box.SIMPLE, show_edge=False, pad_edge=False)
-    t_active.add_column("Name", ratio=3, no_wrap=True)
-    t_active.add_column("Progress", ratio=2) 
-    t_active.add_column("%", width=5, justify="right")
-    t_active.add_column("Size (Done/Total)", width=20, justify="right", style="dim")
-    t_active.add_column("Speed", width=12, justify="right", style="cyan")
-    t_active.add_column("ETA", width=10, justify="right", style="green")
+def _tab_bar(tab, downloads, grabber):
+    def render(label, count, active):
+        style = TAB_ACTIVE_STYLE if active else "dim"
+        return Text(f" {label} ({count}) ", style=style)
 
-    if not active_links:
-        t_active.add_row("[dim italic]No active downloads[/]", "", "", "", "-", "-")
-    else:
-        for l in active_links:
-            total = l.get('bytesTotal', 1) or 1
-            done = l.get('bytesLoaded', 0)
-            pct = (done / total) * 100
-            
+    bar = Table.grid(expand=True)
+    bar.add_column(justify="left")
+    bar.add_row(Text.assemble(
+        render("Downloads", len(downloads), tab == TAB_DOWNLOADS),
+        "  ",
+        render("Link Grabber", len(grabber), tab == TAB_LINKGRABBER),
+        ("   Tab to switch", "dim"),
+    ))
+    return bar
+
+
+def _row_style(row, i, cursor, marked):
+    if i == cursor:
+        return SELECTED_STYLE
+    if row.key in marked:
+        return MARKED_STYLE
+    return None
+
+
+def _mark(row, marked):
+    return "✓" if row.key in marked else " "
+
+
+def _downloads_table(rows, cursor, expanded, height, marked=frozenset()):
+    t = Table(expand=True, box=box.SIMPLE, show_edge=False, pad_edge=False)
+    t.add_column("Name", ratio=3, no_wrap=True)
+    t.add_column("Links", width=6, justify="right", style="dim")
+    t.add_column("Size", width=20, justify="right", style="dim")
+    t.add_column("Status", ratio=1, no_wrap=True, style="yellow")
+    t.add_column("Progress", width=18)
+    t.add_column("%", width=5, justify="right")
+    t.add_column("Speed", width=12, justify="right", style="cyan")
+    t.add_column("ETA", width=9, justify="right", style="green")
+
+    if not rows:
+        t.add_row("[dim italic]No packages in the download list[/]", "", "", "", "", "", "-", "-")
+        return t
+
+    window, offset = _visible_window(rows, cursor, height)
+    for i, row in enumerate(window, start=offset):
+        style = _row_style(row, i, cursor, marked)
+        item = row.item
+        if row.is_package:
+            pct = _package_progress(item)
+            marker = f"{_mark(row, marked)}{'▼' if item.get('uuid') in expanded else '▶'}"
             bar = ProgressBar(
-                total=100, completed=pct, width=None, style="grey23", 
-                complete_style="bold bright_cyan", finished_style="bold bright_green"
+                total=100, completed=pct, width=None, style="grey23",
+                complete_style="bold bright_cyan", finished_style="bold bright_green",
             )
-            
-            size_str = f"{utils.human_size(done)}/{utils.human_size(total)}"
-            
-            t_active.add_row(
-                l['name'], 
-                bar, 
-                f"{pct:.0f}%", 
-                size_str,
-                f"{utils.human_size(l.get('speed', 0))}/s", 
-                utils.human_eta(l.get('eta', 0))
+            t.add_row(
+                f"{marker} {row.name}",
+                f"[{item.get('childCount', 0)}]",
+                f"{utils.human_size(item.get('bytesLoaded', 0))}/{utils.human_size(item.get('bytesTotal', 0))}",
+                _package_status(item),
+                bar,
+                f"{pct:.0f}%",
+                f"{utils.human_size(item.get('speed', 0))}/s" if item.get("speed") else "-",
+                utils.human_eta(item.get("eta", 0)),
+                style=style,
             )
+        else:
+            total = item.get("bytesTotal") or 0
+            pct = 100.0 if item.get("finished") else ((item.get("bytesLoaded", 0) / total) * 100 if total else 0.0)
+            t.add_row(
+                Text(f" {_mark(row, marked)}  └ {row.name}", style="dim" if style is None else None),
+                "",
+                f"{utils.human_size(item.get('bytesLoaded', 0))}/{utils.human_size(total)}",
+                item.get("status") or ("Finished" if item.get("finished") else "-"),
+                "",
+                f"{pct:.0f}%",
+                f"{utils.human_size(item.get('speed', 0))}/s" if item.get("speed") else "",
+                "",
+                style=style,
+            )
+    return t
 
-    panel_active = Panel(t_active, title="Active Queue", border_style="white", box=box.ROUNDED)
 
-    # Pending Queue
-    t_pending = Table(expand=True, box=box.SIMPLE, show_edge=False, pad_edge=False)
-    t_pending.add_column("Name", ratio=1, no_wrap=True)
-    t_pending.add_column("Status", ratio=1, style="yellow")
-    t_pending.add_column("Total Size", width=24, justify="right", style="dim")
+def _grabber_table(rows, cursor, expanded, height, marked=frozenset()):
+    t = Table(expand=True, box=box.SIMPLE, show_edge=False, pad_edge=False)
+    t.add_column("Name", ratio=3, no_wrap=True)
+    t.add_column("Links", width=6, justify="right", style="dim")
+    t.add_column("Size", width=12, justify="right", style="dim")
+    t.add_column("Online", width=8, justify="right", style="green")
+    t.add_column("Offline", width=8, justify="right", style="red")
+    t.add_column("Hoster", ratio=1, no_wrap=True, style="magenta")
+    t.add_column("Save to", ratio=2, no_wrap=True, style="dim")
 
-    if not pending_links:
-        t_pending.add_row("[dim italic]No pending items[/]", "-", "-")
+    if not rows:
+        t.add_row("[dim italic]LinkGrabber is empty[/]", "", "", "", "", "", "")
+        return t
+
+    window, offset = _visible_window(rows, cursor, height)
+    for i, row in enumerate(window, start=offset):
+        style = _row_style(row, i, cursor, marked)
+        item = row.item
+        if row.is_package:
+            marker = f"{_mark(row, marked)}{'▼' if item.get('uuid') in expanded else '▶'}"
+            hosts = item.get("hosts") or []
+            t.add_row(
+                f"{marker} {row.name}",
+                f"[{item.get('childCount', 0)}]",
+                utils.human_size(item.get("bytesTotal", 0)),
+                str(item.get("availableOnlineCount", "-")),
+                str(item.get("availableOfflineCount", "-")),
+                ", ".join(hosts) if hosts else "-",
+                item.get("saveTo", "-"),
+                style=style,
+            )
+        else:
+            availability = item.get("availability", "-")
+            t.add_row(
+                Text(f" {_mark(row, marked)}  └ {row.name}", style="dim" if style is None else None),
+                "",
+                utils.human_size(item.get("bytesTotal", 0)),
+                availability if availability == "ONLINE" else "",
+                "" if availability == "ONLINE" else availability,
+                item.get("host", "-"),
+                item.get("url", "") or "",
+                style=style,
+            )
+    return t
+
+
+def _menu_panel(entries, index, rows):
+    t = Table.grid(padding=(0, 1))
+    t.add_column()
+    for i, entry in enumerate(entries):
+        prefix = "›" if i == index else " "
+        style = SELECTED_STYLE if i == index else ("red" if entry.confirm else "white")
+        t.add_row(Text(f"{prefix} {entry.label}", style=style))
+    title = describe(rows)
+    return Panel(t, title=title, subtitle="[dim]Enter run · Esc close[/]",
+                 border_style="bright_cyan", box=box.ROUNDED)
+
+
+def _properties_panel(row):
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style="dim", justify="right")
+    t.add_column(overflow="fold")
+    for key, value in properties(row):
+        t.add_row(key, value)
+    return Panel(t, title="Properties", subtitle="[dim]Esc close[/]",
+                 border_style="bright_cyan", box=box.ROUNDED)
+
+
+def generate_layout(state, downloads, grabber, rows=None, tab=TAB_DOWNLOADS, cursor=0,
+                    expanded=frozenset(), body_height=20, override_status=None,
+                    mode=MODE_LIST, menu=None, menu_index=0, message="",
+                    marked=frozenset(), form=None):
+    header, border_color = _header(state, downloads, override_status)
+
+    if rows is None:
+        rows = build_rows(downloads if tab == TAB_DOWNLOADS else grabber, expanded)
+
+    if tab == TAB_DOWNLOADS:
+        table = _downloads_table(rows, cursor, expanded, body_height, marked)
+        title = "Downloads"
     else:
-        limit = 10
-        for l in pending_links[:limit]:
-            t_pending.add_row(
-                l['name'],
-                l.get('status', 'Pending'),
-                utils.human_size(l.get('bytesTotal', 0))
-            )
-        if len(pending_links) > limit:
-            t_pending.add_row(f"[italic]...and {len(pending_links)-limit} more[/]", "", "")
+        table = _grabber_table(rows, cursor, expanded, body_height, marked)
+        title = "Link Grabber"
 
-    panel_pending = Panel(t_pending, title="Pending Queue", border_style="dim white", box=box.ROUNDED)
+    if marked:
+        title = f"{title}  [bright_cyan]({len(marked)} selected)[/]"
+    body = Panel(table, title=title, border_style=border_color, box=box.ROUNDED)
+    row = rows[cursor] if rows and cursor < len(rows) else None
 
-    # Footer
-    footer = Align.center("[dim]Press [bold white]s[/] to Start/Stop  |  [bold white]Ctrl+C[/] to Quit[/]")
+    if mode == MODE_ADD:
+        body_layout = Layout(Align.center(_add_panel(form), vertical="middle"))
+    elif mode == MODE_MENU and row is not None:
+        target = [r for r in rows if r.key in marked] or [row]
+        side = Layout(_menu_panel(menu or [], menu_index, target), size=34)
+        body_layout = Layout(name="body")
+        body_layout.split_row(Layout(body), side)
+    elif mode == MODE_PROPERTIES and row is not None:
+        side = Layout(_properties_panel(row), size=60)
+        body_layout = Layout(name="body")
+        body_layout.split_row(Layout(body), side)
+    else:
+        body_layout = Layout(body)
+
+    if mode == MODE_CONFIRM:
+        footer = Align.center(Text(message, style="bold yellow"))
+    elif message:
+        footer = Align.center(Text(message, style="bold green"))
+    else:
+        footer = Align.center(
+            "[dim][bold white]Tab[/] switch  |  [bold white]↑↓[/] move  |  "
+            "[bold white]→←[/] expand  |  [bold white]Space[/] mark  |  "
+            "[bold white]a[/] mark all  |  [bold white]Esc[/] clear  |  "
+            "[bold white]Enter[/] menu  |  [bold white]p[/] properties  |  "
+            "[bold white]n[/] add links  |  [bold white]s[/] start/stop  |  "
+            "[bold white]q[/] quit[/]"
+        )
 
     layout = Layout()
     layout.split(
         Layout(header, size=4),
-        Layout(panel_active, ratio=2), # Active takes more space
-        Layout(panel_pending, ratio=1),
-        Layout(footer, size=1)
+        Layout(_tab_bar(tab, downloads, grabber), size=1),
+        body_layout,
+        Layout(footer, size=1),
     )
     return layout
+
+
+class Poller(threading.Thread):
+    """Poll the device off the main thread.
+
+    Each refresh costs a few hundred milliseconds over the network, and doing
+    it inline made the interface swallow keystrokes for that whole window.
+    """
+
+    def __init__(self, client, api_lock, interval):
+        super().__init__(daemon=True)
+        self.client = client
+        self.api_lock = api_lock
+        self.interval = interval
+        self._stop = threading.Event()
+        self._data_lock = threading.Lock()
+        self._data = ("UNKNOWN", [], [])
+        self.version = 0
+
+    def run(self):
+        while not self._stop.is_set():
+            with self.api_lock:
+                data = self.client.fetch_overview()
+            with self._data_lock:
+                self._data = data
+                self.version += 1
+            if self._stop.wait(self.interval):
+                break
+
+    def snapshot(self):
+        with self._data_lock:
+            return self._data
+
+    def stop(self):
+        self._stop.set()
+
 
 def run(client):
     console = Console()
     console.clear()
-    last_state, last_active, last_pending = "UNKNOWN", [], []
+
+    state, downloads, grabber = "UNKNOWN", [], []
+    tab = TAB_DOWNLOADS
+    cursor = 0
+    expanded = set()
+    marked = set()
+    mode = MODE_LIST
+    menu, menu_index, pending = [], 0, None
+    form = None
+    message = ""
+    override = None
+    rows = []
+
+    def packages():
+        return downloads if tab == TAB_DOWNLOADS else grabber
+
+    def rebuild():
+        nonlocal rows, cursor
+        rows = build_rows(packages(), expanded)
+        cursor = min(cursor, max(0, len(rows) - 1))
+
+    def body_height():
+        # Panel borders, header, tab bar and footer take a fixed slice.
+        return max(3, console.size.height - 12)
+
+    def draw(live):
+        live.update(generate_layout(
+            state, downloads, grabber, rows, tab, cursor, expanded,
+            body_height(), override, mode, menu, menu_index, message, marked,
+            form,
+        ), refresh=True)
+
+    def current_row():
+        return rows[cursor] if rows and cursor < len(rows) else None
+
+    def target_rows():
+        """Marked rows if any, otherwise the row under the cursor."""
+        selection = [r for r in rows if r.key in marked]
+        if selection:
+            return selection
+        row = current_row()
+        return [row] if row is not None else []
+
+    def toggle_expand(row):
+        if row is not None and row.is_package:
+            expanded.symmetric_difference_update({row.uuid})
+            rebuild()
+
+    def execute(action):
+        nonlocal message, mode
+        targets = target_rows()
+        if not targets:
+            return
+        if action == "expand":
+            toggle_expand(current_row())
+            message = ""
+            return
+        if action == "properties":
+            mode = MODE_PROPERTIES
+            return
+        try:
+            with api_lock:
+                message = run_action(client, tab, targets, action)
+        except Exception as exc:
+            message = f"Failed: {exc}"
+        marked.clear()
+        mode = MODE_LIST
+
+    api_lock = threading.Lock()
+    poller = Poller(client, api_lock, config.REFRESH_RATE)
+
+    def call(fn, *args, **kwargs):
+        """Run an API call without racing the poller."""
+        with api_lock:
+            return fn(*args, **kwargs)
 
     try:
-        with KeyboardInput() as kbd, Live(refresh_per_second=4, screen=True) as live:
-            live.update(generate_layout("CONNECTING...", [], [], override_status="LOADING..."))
-            
-            last_state, last_active, last_pending = client.fetch_stats()
-            live.update(generate_layout(last_state, last_active, last_pending))
+        with KeyboardInput() as kbd, Live(refresh_per_second=30, screen=True) as live:
+            live.update(generate_layout("CONNECTING...", [], [], override_status="LOADING..."), refresh=True)
+            state, downloads, grabber = client.fetch_overview()
+            rebuild()
+            draw(live)
+            poller.start()
+            seen_version = poller.version
 
             while True:
-                start_time = time.time()
-                while (time.time() - start_time) < config.REFRESH_RATE:
-                    key = kbd.get_key()
-                    if key == 's':
-                        is_running = last_state in ["RUNNING", "DOWNLOADING"]
-                        fb_status = "STOPPING..." if is_running else "STARTING..."
-                        
-                        live.update(generate_layout(last_state, last_active, last_pending, override_status=fb_status))
-                        
-                        try: client.toggle_state(last_state)
-                        except: pass
-                        
-                        break
-                    
-                    if key: pass 
-                    time.sleep(0.1)
+                key = kbd.get_key()
 
-                state, active, pending = client.fetch_stats()
-                last_state, last_active, last_pending = state, active, pending
-                
-                live.update(generate_layout(state, active, pending))
+                if key is None:
+                    if poller.version != seen_version:
+                        seen_version = poller.version
+                        state, downloads, grabber = poller.snapshot()
+                        rebuild()
+                        draw(live)
+                    time.sleep(0.01)
+                    continue
+
+                if mode == MODE_ADD:
+                    if key == "\x1b":
+                        mode, form, message = MODE_LIST, None, "Cancelled"
+                    elif key in ("\r", "\n"):
+                        if form.is_valid:
+                            try:
+                                with api_lock:
+                                    client.add_links(
+                                        form.values["links"].strip(),
+                                        form.values["package_name"],
+                                        form.values["destination"],
+                                        form.values["extract_password"],
+                                        form.values["download_password"],
+                                        form.values["priority"],
+                                        form.values["autostart"],
+                                    )
+                                count = len(form.values["links"].split())
+                                message = f"Sent {count} url{'s' if count > 1 else ''} to the Link Grabber"
+                                mode, form = MODE_LIST, None
+                            except Exception as exc:
+                                message = f"Failed: {exc}"
+                        else:
+                            message = "Paste at least one url"
+                    elif key == "\t" or key == "DOWN":
+                        form.move(1)
+                    elif key == "UP":
+                        form.move(-1)
+                    elif key in ("LEFT", "RIGHT"):
+                        form.cycle(-1 if key == "LEFT" else 1)
+                    elif key in ("\x7f", "\b"):
+                        form.backspace()
+                    elif len(key) == 1 and key.isprintable():
+                        # Take the rest of a paste in one go instead of one
+                        # character per redraw.
+                        chunk = key
+                        while True:
+                            nxt = kbd.get_key()
+                            if nxt is None:
+                                break
+                            if len(nxt) == 1 and nxt.isprintable():
+                                chunk += nxt
+                                continue
+                            if nxt in ("\r", "\n"):
+                                chunk += " "
+                                continue
+                            break
+                        form.type(chunk)
+                    draw(live)
+                    continue
+
+                if mode == MODE_CONFIRM:
+                    if key in ("y", "Y"):
+                        execute(pending)
+                    else:
+                        message = "Cancelled"
+                    pending, mode = None, MODE_LIST
+                    draw(live)
+                    continue
+
+                if mode == MODE_PROPERTIES:
+                    if key in ("\x1b", "q", "Q", "p", "\r", "\n"):
+                        mode = MODE_LIST
+                    draw(live)
+                    continue
+
+                if mode == MODE_MENU:
+                    if key in ("\x1b", "q", "Q", "LEFT"):
+                        mode = MODE_LIST
+                    elif key in ("UP", "k"):
+                        menu_index = max(0, menu_index - 1)
+                    elif key in ("DOWN", "j"):
+                        menu_index = min(len(menu) - 1, menu_index + 1)
+                    elif key in ("\r", "\n", "RIGHT", " "):
+                        entry = menu[menu_index]
+                        if entry.confirm:
+                            pending = entry.action
+                            mode = MODE_CONFIRM
+                            targets = target_rows()
+                            subject = targets[0].name[:40] if len(targets) == 1 else describe(targets)
+                            message = f"{entry.label} on {subject}?  [y/N]"
+                        else:
+                            execute(entry.action)
+                    draw(live)
+                    continue
+
+                # --- list mode
+                if key in ("q", "Q"):
+                    return
+
+                message = ""
+                if key == "\t":
+                    tab = TAB_LINKGRABBER if tab == TAB_DOWNLOADS else TAB_DOWNLOADS
+                    cursor = 0
+                    marked.clear()
+                    rebuild()
+                elif key in ("UP", "k"):
+                    cursor = max(0, cursor - 1)
+                elif key in ("DOWN", "j"):
+                    cursor = min(max(0, len(rows) - 1), cursor + 1)
+                elif key == "RIGHT":
+                    toggle_expand(current_row())
+                elif key == " ":
+                    row = current_row()
+                    if row is not None:
+                        marked.symmetric_difference_update({row.key})
+                elif key in ("a", "A"):
+                    if marked:
+                        marked.clear()
+                    else:
+                        marked.update(r.key for r in rows)
+                elif key == "\x1b":
+                    marked.clear()
+                elif key == "LEFT":
+                    row = current_row()
+                    if row is not None and not row.is_package:
+                        # Step out of an expanded package.
+                        cursor = rows.index(next(r for r in rows if r.item is row.parent))
+                    elif row is not None:
+                        expanded.discard(row.uuid)
+                        rebuild()
+                elif key in ("\r", "\n"):
+                    targets = target_rows()
+                    if targets:
+                        menu = context_menu(tab, targets)
+                        menu_index = 0
+                        mode = MODE_MENU
+                elif key in ("p", "P"):
+                    if current_row() is not None:
+                        mode = MODE_PROPERTIES
+                elif key in ("n", "N"):
+                    form = AddForm()
+                    mode = MODE_ADD
+                elif key == "s":
+                    is_running = state in ["RUNNING", "DOWNLOADING"]
+                    override = "STOPPING..." if is_running else "STARTING..."
+                    draw(live)
+                    try:
+                        call(client.toggle_state, state)
+                    except Exception:
+                        pass
+                    override = None
+                elif key == "c" and tab == TAB_LINKGRABBER:
+                    override = "CONFIRMING..."
+                    draw(live)
+                    try:
+                        call(client.move_to_downloads)
+                    except Exception:
+                        pass
+                    override = None
+
+                draw(live)
 
     except KeyboardInterrupt:
         pass
+    finally:
+        poller.stop()
