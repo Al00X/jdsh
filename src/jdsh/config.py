@@ -6,7 +6,7 @@ from importlib.metadata import version, PackageNotFoundError
 APP_KEY = "jd_shell_cli"
 
 try:
-    VERSION = version("jd-shell-cli") 
+    VERSION = version("jdsh")
 except PackageNotFoundError:
     VERSION = "0.0.0"
 
